@@ -25,6 +25,7 @@ const TRANSLATION_CHUNK_SIZE = 10;
 const DEFAULT_SOURCE_LANGUAGE = "und";
 const MIN_TRANSLATABLE_LENGTH = 2;
 const MIN_DETECTION_CONFIDENCE = 0.5;
+const MIN_DETECTION_TEXT_LENGTH = 4;
 const INVALID_TRANSLATOR_SOURCE_TAGS = new Set(["auto", "unknown", "und"]);
 const BCP47_STYLE_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i;
 const MAX_TRIVIAL_SEGMENT_LENGTH = 3;
@@ -75,6 +76,10 @@ function createTranslatorCacheKey(sourceLanguage, targetLanguage) {
   return `${sourceLanguage}::${targetLanguage}`;
 }
 
+function createTranslationResultCacheKey(sourceLanguage, sourceText) {
+  return `${sourceLanguage}::${sourceText}`;
+}
+
 function getPrimaryDetectionResult(detectionResult) {
   if (!Array.isArray(detectionResult) || detectionResult.length === 0) {
     return null;
@@ -123,6 +128,14 @@ async function ensureDetectorReady(detectorApi) {
   throw new Error(`Language Detector API availability is ${availability}.`);
 }
 
+function shouldSkipLanguageDetection(text) {
+  if (isTrivialSegment(text)) {
+    return true;
+  }
+
+  return text.trim().length < MIN_DETECTION_TEXT_LENGTH;
+}
+
 async function ensureTranslatorReady(translatorApi, sourceLanguage, targetLanguage) {
   if (typeof translatorApi?.availability !== "function") {
     return;
@@ -166,10 +179,14 @@ class ChromeBuiltInTranslationProvider {
     }
 
     try {
-      await ensureDetectorReady(languageDetectorApi);
       const normalizedTargetLanguage = normalizeTranslatorLanguageTag(targetLanguage);
       if (!normalizedTargetLanguage) {
         throw new Error(`Invalid target language: ${String(targetLanguage)}`);
+      }
+
+      if (!this.sessionCache.isDetectorReady) {
+        await ensureDetectorReady(languageDetectorApi);
+        this.sessionCache.isDetectorReady = true;
       }
 
       return { isAvailable: true, reason: null };
@@ -197,14 +214,14 @@ class ChromeBuiltInTranslationProvider {
     const results = [];
 
     segments.forEach((segment) => {
-      const cachedLanguage = this.sessionCache.detectedLanguageByText.get(segment.sourceText);
+      const cachedDetection = this.sessionCache.detectedLanguageByText.get(segment.sourceText);
 
-      if (cachedLanguage) {
+      if (cachedDetection) {
         results.push({
           segmentId: segment.segmentId,
-          language: cachedLanguage,
-          confidence: 1,
-          skipped: cachedLanguage === DEFAULT_SOURCE_LANGUAGE
+          language: cachedDetection.language,
+          confidence: cachedDetection.confidence,
+          skipped: cachedDetection.skipped
         });
       } else {
         uncachedSegments.push(segment);
@@ -218,70 +235,55 @@ class ChromeBuiltInTranslationProvider {
       return results;
     }
 
-    const detector = await detectorApi.create();
+    const detector = this.sessionCache.detector ?? (await detectorApi.create());
+    this.sessionCache.detector = detector;
 
-    try {
-      for (const chunk of createChunks(uncachedSegments, DETECTION_CHUNK_SIZE)) {
-        const detectedChunk = await Promise.all(
-          chunk.map(async (segment) => {
-            if (isTrivialSegment(segment.sourceText)) {
-              this.sessionCache.detectedLanguageByText.set(segment.sourceText, DEFAULT_SOURCE_LANGUAGE);
-              return {
-                segmentId: segment.segmentId,
-                language: DEFAULT_SOURCE_LANGUAGE,
-                confidence: 0,
-                skipped: true
-              };
-            }
-
-            const detection = await detector.detect(segment.sourceText);
-            const primary = getPrimaryDetectionResult(detection);
-            const detectedLanguage = normalizeDetectedLanguageTag(primary?.detectedLanguage);
-            const confidence = primary?.confidence ?? 0;
-
-            if (
-              detectedLanguage === DEFAULT_SOURCE_LANGUAGE ||
-              confidence < MIN_DETECTION_CONFIDENCE
-            ) {
-              this.sessionCache.detectedLanguageByText.set(
-                segment.sourceText,
-                DEFAULT_SOURCE_LANGUAGE
-              );
-              console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
-                segmentId: segment.segmentId,
-                detectedLanguage,
-                confidence
-              });
-
-              return {
-                segmentId: segment.segmentId,
-                language: DEFAULT_SOURCE_LANGUAGE,
-                confidence,
-                skipped: true
-              };
-            }
-
-            console.info("[Page Translator] Detected source language", {
-              segmentId: segment.segmentId,
-              sourceLanguage: detectedLanguage,
-              confidence
-            });
-
-            this.sessionCache.detectedLanguageByText.set(segment.sourceText, detectedLanguage);
-
+    for (const chunk of createChunks(uncachedSegments, DETECTION_CHUNK_SIZE)) {
+      const detectedChunk = await Promise.all(
+        chunk.map(async (segment) => {
+          if (shouldSkipLanguageDetection(segment.sourceText)) {
+            const skippedDetection = {
+              language: DEFAULT_SOURCE_LANGUAGE,
+              confidence: 0,
+              skipped: true
+            };
+            this.sessionCache.detectedLanguageByText.set(segment.sourceText, skippedDetection);
             return {
               segmentId: segment.segmentId,
-              language: detectedLanguage,
-              confidence,
-              skipped: false
+              ...skippedDetection
             };
-          })
-        );
+          }
 
-        results.push(...detectedChunk);
-      }
-    } finally {
-      await detector.destroy?.();
+          const detection = await detector.detect(segment.sourceText);
+          const primary = getPrimaryDetectionResult(detection);
+          const detectedLanguage = normalizeDetectedLanguageTag(primary?.detectedLanguage);
+          const confidence = primary?.confidence ?? 0;
+          const shouldSkip =
+            detectedLanguage === DEFAULT_SOURCE_LANGUAGE || confidence < MIN_DETECTION_CONFIDENCE;
+          const detectionResult = {
+            language: shouldSkip ? DEFAULT_SOURCE_LANGUAGE : detectedLanguage,
+            confidence,
+            skipped: shouldSkip
+          };
+
+          this.sessionCache.detectedLanguageByText.set(segment.sourceText, detectionResult);
+
+          if (shouldSkip) {
+            console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
+              segmentId: segment.segmentId,
+              detectedLanguage,
+              confidence
+            });
+          }
+
+          return {
+            segmentId: segment.segmentId,
+            ...detectionResult
+          };
+        })
+      );
+
+      results.push(...detectedChunk);
     }
 
     return results;
@@ -336,6 +338,7 @@ class ChromeBuiltInTranslationProvider {
       }
 
       if (this.sessionCache.unavailableLanguagePairs.has(cacheKey)) {
+        this.sessionCache.metrics.translatorCacheHitCount += 1;
         return null;
       }
 
@@ -431,7 +434,7 @@ class ChromeBuiltInTranslationProvider {
               };
             }
 
-            const translationCacheKey = createTranslatorCacheKey(
+            const translationCacheKey = createTranslationResultCacheKey(
               normalizedSourceLanguage,
               segment.sourceText
             );
@@ -506,6 +509,8 @@ const EXCLUDED_TAGS = new Set([
 let lastExtraction = null;
 
 const translationSessionCache = {
+  detector: null,
+  isDetectorReady: false,
   detectedLanguageByText: new Map(),
   translatedByTargetLanguage: new Map(),
   translatorByLanguagePair: new Map(),
@@ -531,6 +536,20 @@ const translationSessionCache = {
     }
 
     this.translatedByTargetLanguage.delete(targetLanguage);
+
+    for (const cacheKey of this.translatorByLanguagePair.keys()) {
+      if (cacheKey.endsWith(`::${targetLanguage}`)) {
+        const translator = this.translatorByLanguagePair.get(cacheKey);
+        translator?.destroy?.();
+        this.translatorByLanguagePair.delete(cacheKey);
+      }
+    }
+
+    for (const cacheKey of [...this.unavailableLanguagePairs]) {
+      if (cacheKey.endsWith(`::${targetLanguage}`)) {
+        this.unavailableLanguagePairs.delete(cacheKey);
+      }
+    }
   }
 };
 
@@ -540,7 +559,8 @@ const translationState = {
   translatedNodes: [],
   lastError: null,
   lastStats: null,
-  inFlightAction: null
+  inFlightAction: null,
+  lastAppliedTargetLanguage: null
 };
 
 function isHiddenElement(element) {
@@ -698,6 +718,8 @@ function writeTranslatedTextToNodes(extraction, translatedSegments) {
   );
 
   const translatedNodes = [];
+  let updatedNodeCount = 0;
+  let unchangedNodeCount = 0;
 
   extraction.segments.forEach((segment) => {
     const translatedText = translatedSegmentsById.get(segment.segmentId);
@@ -714,7 +736,13 @@ function writeTranslatedTextToNodes(extraction, translatedSegments) {
         translatedText
       );
 
-      nodeMapping.textNode.nodeValue = translatedNodeText;
+      if (nodeMapping.textNode.nodeValue !== translatedNodeText) {
+        nodeMapping.textNode.nodeValue = translatedNodeText;
+        updatedNodeCount += 1;
+      } else {
+        unchangedNodeCount += 1;
+      }
+
       translatedNodes.push({
         textNode: nodeMapping.textNode,
         originalText: nodeMapping.originalText,
@@ -723,7 +751,7 @@ function writeTranslatedTextToNodes(extraction, translatedSegments) {
     });
   });
 
-  return translatedNodes;
+  return { translatedNodes, updatedNodeCount, unchangedNodeCount };
 }
 
 function resetStateAfterRestore(restoredCount = 0) {
@@ -755,6 +783,19 @@ function restoreOriginalText() {
 
   resetStateAfterRestore(restoredCount);
   console.info("[Page Translator] Restore stats", translationState.lastStats);
+}
+
+function invalidateTranslationStateForTargetChange(nextTargetLanguage) {
+  const normalizedNextTargetLanguage = normalizeTranslatorLanguageTag(nextTargetLanguage);
+  const previousTargetLanguage = translationState.lastAppliedTargetLanguage;
+
+  if (!previousTargetLanguage || !normalizedNextTargetLanguage) {
+    return;
+  }
+
+  if (previousTargetLanguage !== normalizedNextTargetLanguage) {
+    translationSessionCache.invalidateTargetTranslationCache(previousTargetLanguage);
+  }
 }
 
 function validateCapability(capability) {
@@ -811,30 +852,33 @@ async function applyTranslation(targetLanguage) {
     detectedLanguagesBySegmentId
   );
 
-  const translatedNodes = writeTranslatedTextToNodes(extraction, translatedSegments);
+  const { translatedNodes, updatedNodeCount, unchangedNodeCount } = writeTranslatedTextToNodes(
+    extraction,
+    translatedSegments
+  );
   const stats = createStatsFromResults(extraction, detectedLanguages, translatedSegments);
 
   translationState.isTranslated = true;
   translationState.targetLanguage = normalizedTargetLanguage;
   translationState.translatedNodes = translatedNodes;
   translationState.lastError = null;
+  translationState.lastAppliedTargetLanguage = normalizedTargetLanguage;
   translationState.lastStats = stats;
 
   console.info("[Page Translator] Cache metrics", translationSessionCache.metrics);
+
+  console.info("[Page Translator] DOM write stats", {
+    updatedNodeCount,
+    unchangedNodeCount
+  });
 
   console.info("[Page Translator] Translation stats", stats);
 }
 
 async function translateOrRetranslate(targetLanguage) {
   const normalizedTargetLanguage = targetLanguage || DEFAULT_TARGET_LANGUAGE;
-  const previousTargetLanguage = translationState.targetLanguage;
-
   if (translationState.isTranslated) {
     restoreOriginalText();
-  }
-
-  if (previousTargetLanguage && previousTargetLanguage !== normalizedTargetLanguage) {
-    translationSessionCache.invalidateTargetTranslationCache(previousTargetLanguage);
   }
 
   await applyTranslation(normalizedTargetLanguage);
@@ -870,6 +914,7 @@ async function onPageTranslationActionRequested(action, targetLanguage) {
     }
 
     if (normalizedAction === "translate") {
+      invalidateTranslationStateForTargetChange(targetLanguage || DEFAULT_TARGET_LANGUAGE);
       await translateOrRetranslate(targetLanguage);
       return getSerializableTranslationState();
     }
