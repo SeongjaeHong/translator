@@ -25,7 +25,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     await chrome.storage.sync.get(STORAGE_KEYS.targetLanguage);
 
   chrome.tabs.sendMessage(tab.id, {
-    type: MESSAGE_TYPES.TRANSLATE_PAGE_REQUESTED,
+    type: MESSAGE_TYPES.TOGGLE_PAGE_TRANSLATION_REQUESTED,
     payload: { targetLanguage }
   });
 });

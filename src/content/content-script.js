@@ -13,6 +13,12 @@ const EXCLUDED_TAGS = new Set([
 
 let lastExtraction = null;
 
+const translationState = {
+  isTranslated: false,
+  targetLanguage: null,
+  translatedNodes: []
+};
+
 function isHiddenElement(element) {
   if (!element) {
     return false;
@@ -133,36 +139,96 @@ function collectTranslatableTextSegments(root = document.body) {
   };
 }
 
-function onTranslatePageRequested(targetLanguage) {
+function createMockTranslation(sourceText, targetLanguage) {
+  return `[${targetLanguage}] ${sourceText}`;
+}
+
+function applyTranslation(extraction, targetLanguage) {
+  const translatedSegmentsById = new Map(
+    extraction.segments.map((segment) => [
+      segment.segmentId,
+      createMockTranslation(segment.sourceText, targetLanguage)
+    ])
+  );
+
+  const translatedNodes = [];
+
+  extraction.segments.forEach((segment) => {
+    const translatedText = translatedSegmentsById.get(segment.segmentId);
+
+    segment.nodeMappingIndexes.forEach((mappingIndex) => {
+      const nodeMapping = extraction.nodeMappings[mappingIndex];
+      if (!nodeMapping?.textNode) {
+        return;
+      }
+
+      nodeMapping.textNode.nodeValue = translatedText;
+      translatedNodes.push({
+        textNode: nodeMapping.textNode,
+        originalText: nodeMapping.originalText,
+        translatedText
+      });
+    });
+  });
+
+  translationState.isTranslated = true;
+  translationState.targetLanguage = targetLanguage;
+  translationState.translatedNodes = translatedNodes;
+}
+
+function restoreOriginalText() {
+  translationState.translatedNodes.forEach((nodeState) => {
+    if (!nodeState.textNode) {
+      return;
+    }
+
+    nodeState.textNode.nodeValue = nodeState.originalText;
+  });
+
+  translationState.isTranslated = false;
+  translationState.targetLanguage = null;
+  translationState.translatedNodes = [];
+}
+
+function onToggleTranslationRequested(targetLanguage) {
+  if (translationState.isTranslated) {
+    restoreOriginalText();
+    console.info("[Page Translator] Restored original page text");
+    return;
+  }
+
   const extraction = collectTranslatableTextSegments(document.body);
   lastExtraction = extraction;
+  applyTranslation(extraction, targetLanguage);
 
   console.info(
-    "[Page Translator] Extracted DOM text segments for translation",
+    "[Page Translator] Applied mock translation to DOM text segments",
     {
       targetLanguage,
       totalTextNodesFound: extraction.totalTextNodesFound,
       totalTextSegmentsExtracted: extraction.segments.length,
-      totalSkippedNodes: extraction.totalSkippedNodes
+      totalSkippedNodes: extraction.totalSkippedNodes,
+      totalTranslatedNodes: translationState.translatedNodes.length
     }
   );
-
-  // Placeholder for future translation step:
-  // - per-segment translation: iterate extraction.segments
-  // - batch translation: send extraction.segments.map((s) => s.sourceText)
 }
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type !== MESSAGE_TYPES.TRANSLATE_PAGE_REQUESTED) {
+  if (message?.type !== MESSAGE_TYPES.TOGGLE_PAGE_TRANSLATION_REQUESTED) {
     return;
   }
 
   const language = message.payload?.targetLanguage ?? "ko";
-  onTranslatePageRequested(language);
+  onToggleTranslationRequested(language);
 });
 
 // Exposed for console-level manual checks while iterating on extraction quality.
 window.__pageTranslatorDebug = {
   collectTranslatableTextSegments,
-  getLastExtraction: () => lastExtraction
+  getLastExtraction: () => lastExtraction,
+  getTranslationState: () => ({
+    isTranslated: translationState.isTranslated,
+    targetLanguage: translationState.targetLanguage,
+    totalTranslatedNodes: translationState.translatedNodes.length
+  })
 };
