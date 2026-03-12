@@ -10,7 +10,7 @@ const actionButton = document.querySelector("#translate-action");
 const statusMessage = document.querySelector("#status-message");
 
 function getActionLabel(isTranslated) {
-  return isTranslated ? "Restore original" : "Translate page";
+  return isTranslated ? "Restore Original" : "Translate Page";
 }
 
 function setStatusMessage(message = "", tone = "neutral") {
@@ -28,35 +28,40 @@ function getUserFacingActionError(error) {
   const message = error instanceof Error ? error.message : String(error ?? "");
 
   if (message === "content-script-unavailable") {
-    return "This tab cannot be translated.";
+    return "Translation unavailable";
   }
 
   if (message && message !== "Error") {
     return message;
   }
 
-  return "Unable to communicate with this page.";
+  return "Translation unavailable";
 }
 
-function buildStatusFromState(state) {
+function buildStatusFromState(state, targetLanguageLabel = "") {
   if (state?.lastError) {
     return {
-      message: state.lastError,
+      message: "Translation unavailable",
       tone: "error"
     };
   }
 
-  if (state?.inFlightAction) {
+  if (state?.isTranslated) {
     return {
-      message: "Translation in progress...",
+      message: `Translated to ${targetLanguageLabel || "selected language"}`,
       tone: "neutral"
     };
   }
 
   return {
-    message: state?.isTranslated ? "Page is translated." : "",
+    message: "Ready to translate",
     tone: "neutral"
   };
+}
+
+function getSelectedLanguageLabel() {
+  const selectedOption = languageSelect.selectedOptions?.[0];
+  return selectedOption?.textContent?.trim() ?? "";
 }
 
 function isRestrictedTabUrl(url) {
@@ -104,7 +109,7 @@ async function getPageTranslationState(tab) {
   if (!isReady) {
     return {
       isTranslated: false,
-      lastError: "This tab cannot be translated."
+      lastError: "Translation unavailable"
     };
   }
 
@@ -123,8 +128,8 @@ async function getPageTranslationState(tab) {
   return { isTranslated: false, lastError: null };
 }
 
-function setActionButtonState(isTranslated, isEnabled = true) {
-  actionButton.textContent = getActionLabel(isTranslated);
+function setActionButtonState(isTranslated, isEnabled = true, isLoading = false) {
+  actionButton.textContent = isLoading ? "Translating…" : getActionLabel(isTranslated);
   actionButton.disabled = !isEnabled;
 }
 
@@ -133,13 +138,13 @@ async function refreshActionButton() {
 
   if (!tab?.id || isRestrictedTabUrl(tab.url)) {
     setActionButtonState(false, false);
-    setStatusMessage("This tab cannot be translated.", "error");
+    setStatusMessage("Translation unavailable", "error");
     return;
   }
 
   const state = await getPageTranslationState(tab);
   setActionButtonState(state.isTranslated, true);
-  const status = buildStatusFromState(state);
+  const status = buildStatusFromState(state, getSelectedLanguageLabel());
   setStatusMessage(status.message, status.tone);
 }
 
@@ -150,17 +155,25 @@ async function loadSettings() {
 
 async function saveSettings() {
   await setTargetLanguage(languageSelect.value);
+
+  const tab = await getActiveTab();
+  if (!tab?.id || isRestrictedTabUrl(tab.url)) {
+    return;
+  }
+
+  const state = await getPageTranslationState(tab);
+  const status = buildStatusFromState(state, getSelectedLanguageLabel());
+  setStatusMessage(status.message, status.tone);
 }
 
 async function onActionButtonClicked() {
   const tab = await getActiveTab();
   if (!tab?.id || isRestrictedTabUrl(tab.url)) {
-    setStatusMessage("This tab cannot be translated.", "error");
+    setStatusMessage("Translation unavailable", "error");
     return;
   }
 
-  setActionButtonState(false, false);
-  setStatusMessage("");
+  setActionButtonState(false, false, true);
 
   try {
     const isReady = await ensureContentScriptLoaded(tab.id);
@@ -177,9 +190,18 @@ async function onActionButtonClicked() {
       }
     });
 
-    setActionButtonState(Boolean(nextState?.isTranslated), true);
-    const status = buildStatusFromState(nextState);
-    setStatusMessage(status.message, status.tone);
+    const isTranslated = Boolean(nextState?.isTranslated);
+    setActionButtonState(isTranslated, true);
+
+    if (nextState?.lastError) {
+      setStatusMessage("Translation unavailable", "error");
+      return;
+    }
+
+    const nextStatus = isTranslated
+      ? `Translated to ${getSelectedLanguageLabel() || "selected language"}`
+      : "Original restored";
+    setStatusMessage(nextStatus, "neutral");
   } catch (error) {
     setActionButtonState(false, true);
     setStatusMessage(getUserFacingActionError(error), "error");
