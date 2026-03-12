@@ -1,3 +1,4 @@
+import { DEFAULT_TARGET_LANGUAGE } from "../shared/constants.js";
 import { MESSAGE_TYPES } from "../shared/messages.js";
 import { createTranslationProvider } from "./providers/provider-factory.js";
 
@@ -19,7 +20,8 @@ const translationState = {
   targetLanguage: null,
   translatedNodes: [],
   lastError: null,
-  lastStats: null
+  lastStats: null,
+  inFlightAction: null
 };
 
 function isHiddenElement(element) {
@@ -33,15 +35,11 @@ function isHiddenElement(element) {
 
   const style = window.getComputedStyle(element);
 
-  if (
+  return (
     style.display === "none" ||
     style.visibility === "hidden" ||
     style.visibility === "collapse"
-  ) {
-    return true;
-  }
-
-  return false;
+  );
 }
 
 function isInsideExcludedContainer(element) {
@@ -181,49 +179,7 @@ function writeTranslatedTextToNodes(extraction, translatedSegments) {
   return translatedNodes;
 }
 
-async function applyTranslation(extraction, targetLanguage) {
-  const provider = createTranslationProvider();
-  const capability = await provider.checkAvailability(targetLanguage);
-
-  if (!capability.isAvailable) {
-    throw new Error(capability.reason ?? "Built-in translation APIs are unavailable.");
-  }
-
-  const detectedLanguages = await provider.detectLanguages(extraction.segments);
-  const detectedLanguagesBySegmentId = new Map(
-    detectedLanguages.map((result) => [result.segmentId, result.language])
-  );
-
-  const translatedSegments = await provider.translateSegments(
-    extraction.segments,
-    targetLanguage,
-    detectedLanguagesBySegmentId
-  );
-
-  const translatedNodes = writeTranslatedTextToNodes(extraction, translatedSegments);
-  const stats = createStatsFromResults(extraction, detectedLanguages, translatedSegments);
-
-  translationState.isTranslated = true;
-  translationState.targetLanguage = targetLanguage;
-  translationState.translatedNodes = translatedNodes;
-  translationState.lastError = null;
-  translationState.lastStats = stats;
-
-  console.info("[Page Translator] Translation stats", stats);
-}
-
-function restoreOriginalText() {
-  let restoredCount = 0;
-
-  translationState.translatedNodes.forEach((nodeState) => {
-    if (!nodeState.textNode) {
-      return;
-    }
-
-    nodeState.textNode.nodeValue = nodeState.originalText;
-    restoredCount += 1;
-  });
-
+function resetStateAfterRestore(restoredCount = 0) {
   translationState.isTranslated = false;
   translationState.targetLanguage = null;
   translationState.translatedNodes = [];
@@ -235,20 +191,89 @@ function restoreOriginalText() {
     skippedCount: 0,
     restoredCount
   };
+}
 
+function restoreOriginalText() {
+  let restoredCount = 0;
+
+  translationState.translatedNodes.forEach((nodeState) => {
+    if (!nodeState.textNode || !nodeState.textNode.isConnected) {
+      return;
+    }
+
+    nodeState.textNode.nodeValue = nodeState.originalText;
+    restoredCount += 1;
+  });
+
+  resetStateAfterRestore(restoredCount);
   console.info("[Page Translator] Restore stats", translationState.lastStats);
 }
 
-async function onToggleTranslationRequested(targetLanguage) {
-  if (translationState.isTranslated) {
-    restoreOriginalText();
+function validateCapability(capability) {
+  if (capability?.isAvailable) {
     return;
   }
 
+  throw new Error(
+    capability?.reason ??
+      "Built-in translation is unavailable in this environment. Use a Chrome build with the Language Detector and Translator APIs enabled."
+  );
+}
+
+async function applyTranslation(targetLanguage) {
   const extraction = collectTranslatableTextSegments(document.body);
   lastExtraction = extraction;
 
-  await applyTranslation(extraction, targetLanguage);
+  if (extraction.segments.length === 0) {
+    translationState.isTranslated = false;
+    translationState.targetLanguage = null;
+    translationState.translatedNodes = [];
+    translationState.lastError = null;
+    translationState.lastStats = {
+      extractionCount: 0,
+      detectedLanguageCount: 0,
+      translatedCount: 0,
+      skippedCount: 0,
+      restoredCount: 0
+    };
+
+    return;
+  }
+
+  const provider = createTranslationProvider();
+  const normalizedTargetLanguage = targetLanguage || DEFAULT_TARGET_LANGUAGE;
+  const capability = await provider.checkAvailability(normalizedTargetLanguage);
+  validateCapability(capability);
+
+  const detectedLanguages = await provider.detectLanguages(extraction.segments);
+  const detectedLanguagesBySegmentId = new Map(
+    detectedLanguages.map((result) => [result.segmentId, result.language])
+  );
+
+  const translatedSegments = await provider.translateSegments(
+    extraction.segments,
+    normalizedTargetLanguage,
+    detectedLanguagesBySegmentId
+  );
+
+  const translatedNodes = writeTranslatedTextToNodes(extraction, translatedSegments);
+  const stats = createStatsFromResults(extraction, detectedLanguages, translatedSegments);
+
+  translationState.isTranslated = true;
+  translationState.targetLanguage = normalizedTargetLanguage;
+  translationState.translatedNodes = translatedNodes;
+  translationState.lastError = null;
+  translationState.lastStats = stats;
+
+  console.info("[Page Translator] Translation stats", stats);
+}
+
+async function translateOrRetranslate(targetLanguage) {
+  if (translationState.isTranslated) {
+    restoreOriginalText();
+  }
+
+  await applyTranslation(targetLanguage);
 }
 
 function getSerializableTranslationState() {
@@ -257,29 +282,44 @@ function getSerializableTranslationState() {
     targetLanguage: translationState.targetLanguage,
     totalTranslatedNodes: translationState.translatedNodes.length,
     lastError: translationState.lastError,
-    lastStats: translationState.lastStats
+    lastStats: translationState.lastStats,
+    inFlightAction: translationState.inFlightAction
   };
 }
 
 async function onPageTranslationActionRequested(action, targetLanguage) {
-  if (action === "restore") {
+  if (translationState.inFlightAction) {
+    throw new Error("Translation is already in progress. Please wait and try again.");
+  }
+
+  const normalizedAction = action ?? "toggle";
+
+  translationState.inFlightAction = normalizedAction;
+
+  try {
+    if (normalizedAction === "restore") {
+      if (translationState.isTranslated) {
+        restoreOriginalText();
+      }
+
+      return getSerializableTranslationState();
+    }
+
+    if (normalizedAction === "translate") {
+      await translateOrRetranslate(targetLanguage);
+      return getSerializableTranslationState();
+    }
+
     if (translationState.isTranslated) {
       restoreOriginalText();
+      return getSerializableTranslationState();
     }
 
+    await applyTranslation(targetLanguage);
     return getSerializableTranslationState();
+  } finally {
+    translationState.inFlightAction = null;
   }
-
-  if (action === "translate") {
-    if (!translationState.isTranslated) {
-      await onToggleTranslationRequested(targetLanguage);
-    }
-
-    return getSerializableTranslationState();
-  }
-
-  await onToggleTranslationRequested(targetLanguage);
-  return getSerializableTranslationState();
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -290,7 +330,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED) {
     const action = message.payload?.action ?? "toggle";
-    const language = message.payload?.targetLanguage ?? "ko";
+    const language = message.payload?.targetLanguage ?? DEFAULT_TARGET_LANGUAGE;
 
     onPageTranslationActionRequested(action, language)
       .then((state) => sendResponse(state))
@@ -298,9 +338,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const errorMessage =
           error instanceof Error
             ? error.message
-            : "Built-in translation is unavailable in this environment.";
+            : "Built-in translation failed to initialize. Try reloading the page or enabling the required Chrome AI features.";
 
         translationState.lastError = errorMessage;
+        translationState.inFlightAction = null;
         translationState.lastStats = {
           extractionCount: lastExtraction?.segments.length ?? 0,
           detectedLanguageCount: 0,

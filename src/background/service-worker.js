@@ -47,7 +47,6 @@ chrome.runtime.onInstalled.addListener(async () => {
       [STORAGE_KEYS.targetLanguage]: DEFAULT_TARGET_LANGUAGE
     });
   }
-
 });
 
 chrome.contextMenus.onShown.addListener(async (info, tab) => {
@@ -65,14 +64,13 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
-  const state = await getPageTranslationState(tab.id);
-  const action = state.isTranslated ? "restore" : "translate";
   const targetLanguage = await getTargetLanguage();
+
   try {
     const nextState = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
       payload: {
-        action,
+        action: "toggle",
         targetLanguage
       }
     });
