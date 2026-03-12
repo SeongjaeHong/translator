@@ -29,6 +29,7 @@ const MIN_DETECTION_TEXT_LENGTH = 4;
 const INVALID_TRANSLATOR_SOURCE_TAGS = new Set(["auto", "unknown", "und"]);
 const BCP47_STYLE_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i;
 const MAX_TRIVIAL_SEGMENT_LENGTH = 3;
+const SHORT_DATE_LIKE_SEGMENT_PATTERN = /^\d{1,4}(?:\s*[./:-]\s*\d{1,4}){1,2}$/u;
 
 function getLanguageDetectorApi() {
   return globalThis.LanguageDetector;
@@ -88,6 +89,19 @@ function getPrimaryDetectionResult(detectionResult) {
   return detectionResult[0] ?? null;
 }
 
+function isDateLikeSegment(text) {
+  if (!text || typeof text !== "string") {
+    return false;
+  }
+
+  const normalized = text.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  return SHORT_DATE_LIKE_SEGMENT_PATTERN.test(normalized);
+}
+
 function isTrivialSegment(text) {
   if (!text || typeof text !== "string") {
     return true;
@@ -102,7 +116,11 @@ function isTrivialSegment(text) {
     return true;
   }
 
-  if (normalized.length <= MAX_TRIVIAL_SEGMENT_LENGTH && !/\s/u.test(normalized)) {
+  if (
+    normalized.length <= MAX_TRIVIAL_SEGMENT_LENGTH &&
+    !/\s/u.test(normalized) &&
+    !isDateLikeSegment(normalized)
+  ) {
     return true;
   }
 
@@ -133,7 +151,12 @@ function shouldSkipLanguageDetection(text) {
     return true;
   }
 
-  return text.trim().length < MIN_DETECTION_TEXT_LENGTH;
+  const normalized = text.trim();
+  if (isDateLikeSegment(normalized)) {
+    return false;
+  }
+
+  return normalized.length < MIN_DETECTION_TEXT_LENGTH;
 }
 
 async function ensureTranslatorReady(translatorApi, sourceLanguage, targetLanguage) {
