@@ -1,5 +1,4 @@
 import { MESSAGE_TYPES } from "../shared/messages.js";
-import { createDefaultProviderConfig } from "../shared/providers.js";
 import { createTranslationProvider } from "./providers/provider-factory.js";
 
 const EXCLUDED_TAGS = new Set([
@@ -141,8 +140,13 @@ function collectTranslatableTextSegments(root = document.body) {
   };
 }
 
-async function applyTranslation(extraction, targetLanguage, providerId, providerConfig) {
-  const provider = createTranslationProvider(providerId, providerConfig);
+async function applyTranslation(extraction, targetLanguage) {
+  const provider = createTranslationProvider();
+  const capability = await provider.checkAvailability();
+
+  if (!capability.isAvailable) {
+    throw new Error(capability.reason ?? "Built-in translation APIs are unavailable.");
+  }
   const detectedLanguages = await provider.detectLanguages(extraction.segments);
   const detectedLanguagesBySegmentId = new Map(
     detectedLanguages.map((result) => [result.segmentId, result.language])
@@ -196,7 +200,7 @@ function restoreOriginalText() {
   translationState.translatedNodes = [];
 }
 
-async function onToggleTranslationRequested(targetLanguage, providerId, providerConfig) {
+async function onToggleTranslationRequested(targetLanguage) {
   if (translationState.isTranslated) {
     restoreOriginalText();
     console.info("[Page Translator] Restored original page text");
@@ -205,13 +209,12 @@ async function onToggleTranslationRequested(targetLanguage, providerId, provider
 
   const extraction = collectTranslatableTextSegments(document.body);
   lastExtraction = extraction;
-  await applyTranslation(extraction, targetLanguage, providerId, providerConfig);
+  await applyTranslation(extraction, targetLanguage);
 
   console.info(
-    "[Page Translator] Applied provider-based translation to DOM text segments",
+    "[Page Translator] Applied built-in Chrome translation to DOM text segments",
     {
       targetLanguage,
-      providerId,
       totalTextNodesFound: extraction.totalTextNodesFound,
       totalTextSegmentsExtracted: extraction.segments.length,
       totalSkippedNodes: extraction.totalSkippedNodes,
@@ -228,12 +231,7 @@ function getSerializableTranslationState() {
   };
 }
 
-async function onPageTranslationActionRequested(
-  action,
-  targetLanguage,
-  providerId,
-  providerConfig
-) {
+async function onPageTranslationActionRequested(action, targetLanguage) {
   if (action === "restore") {
     if (translationState.isTranslated) {
       restoreOriginalText();
@@ -245,13 +243,13 @@ async function onPageTranslationActionRequested(
 
   if (action === "translate") {
     if (!translationState.isTranslated) {
-      await onToggleTranslationRequested(targetLanguage, providerId, providerConfig);
+      await onToggleTranslationRequested(targetLanguage);
     }
 
     return getSerializableTranslationState();
   }
 
-  await onToggleTranslationRequested(targetLanguage, providerId, providerConfig);
+  await onToggleTranslationRequested(targetLanguage);
   return getSerializableTranslationState();
 }
 
@@ -264,18 +262,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED) {
     const action = message.payload?.action ?? "toggle";
     const language = message.payload?.targetLanguage ?? "ko";
-    const providerId = message.payload?.providerId;
-    const providerConfig =
-      message.payload?.providerConfig ?? createDefaultProviderConfig();
 
-    onPageTranslationActionRequested(
-      action,
-      language,
-      providerId,
-      providerConfig
-    )
+    onPageTranslationActionRequested(action, language)
       .then((state) => sendResponse(state))
-      .catch((_error) => sendResponse(getSerializableTranslationState()));
+      .catch((error) => {
+        console.warn("[Page Translator] Translation request failed", error);
+        sendResponse(getSerializableTranslationState());
+      });
 
     return true;
   }

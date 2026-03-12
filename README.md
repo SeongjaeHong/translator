@@ -8,19 +8,15 @@ A minimal Manifest V3 Chrome Extension scaffold for translating the current page
 - Background service worker that:
   - Creates a `Translate page` context menu item.
   - Initializes default target language to Korean (`ko`).
-  - Initializes provider settings with Google as the default translation provider.
   - Sends translation action messages to the content script.
 - Content script that:
   - Extracts translatable DOM text segments.
-  - Routes translation through a provider abstraction (Google/OpenAI/Gemini).
-  - Detects language per extracted segment (placeholder logic for now).
+  - Uses Chrome built-in Language Detector API per segment.
+  - Uses Chrome built-in Translator API by source-language groups and small batches.
   - Supports restore to original page text.
+  - Gracefully skips translation when built-in AI APIs are unavailable.
 - Options page with:
   - Target language dropdown persisted in `chrome.storage.sync`.
-  - Translation provider dropdown persisted in `chrome.storage.sync`.
-- Shared constants/message types/settings models for clean wiring.
-
-> External API calls are intentionally not implemented yet. The architecture is provider-ready.
 
 ## Project structure
 
@@ -34,9 +30,8 @@ A minimal Manifest V3 Chrome Extension scaffold for translating the current page
     │   ├── content-script.js
     │   └── providers
     │       ├── base-provider.js
-    │       ├── gemini-provider.js
-    │       ├── google-provider.js
-    │       ├── openai-provider.js
+    │       ├── batching.js
+    │       ├── chrome-built-in-provider.js
     │       └── provider-factory.js
     ├── options
     │   ├── options.css
@@ -45,8 +40,6 @@ A minimal Manifest V3 Chrome Extension scaffold for translating the current page
     └── shared
         ├── constants.js
         ├── messages.js
-        ├── provider-settings.js
-        ├── providers.js
         └── target-language.js
 ```
 
@@ -60,11 +53,11 @@ A minimal Manifest V3 Chrome Extension scaffold for translating the current page
 ## Manual sanity checks
 
 1. Right-click a page and confirm `Translate page` is present.
-2. Open extension options and change target language and provider.
-3. Refresh options and confirm language/provider selections persist.
+2. Open extension options and change target language.
+3. Refresh options and confirm language selection persists.
 4. Click `Translate page` and confirm translated text updates and restore works.
 
 ## Notes
 
-- Permissions are intentionally minimal: `contextMenus`, `storage`, `scripting`, `activeTab`.
+- Permissions are intentionally minimal: `contextMenus`, `storage`, `activeTab`.
 - No secrets, generated artifacts, or build outputs are included.
