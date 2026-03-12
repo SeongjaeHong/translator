@@ -18,7 +18,7 @@
  */
 
 export class BaseTranslationProvider {
-  async checkAvailability() {
+  async checkAvailability(_targetLanguage) {
     throw new Error("checkAvailability is not implemented");
   }
 

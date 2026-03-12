@@ -7,6 +7,7 @@ import {
 
 const languageSelect = document.querySelector("#target-language");
 const actionButton = document.querySelector("#translate-action");
+const statusMessage = document.querySelector("#status-message");
 
 function getActionFromState(isTranslated) {
   return isTranslated ? "restore" : "translate";
@@ -16,6 +17,10 @@ function getActionLabel(isTranslated) {
   return isTranslated ? "Restore original" : "Translate page";
 }
 
+function setStatusMessage(message = "") {
+  statusMessage.textContent = message;
+}
+
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs[0];
@@ -23,7 +28,7 @@ async function getActiveTab() {
 
 async function getPageTranslationState(tabId) {
   if (!tabId) {
-    return { isTranslated: false };
+    return { isTranslated: false, lastError: null };
   }
 
   try {
@@ -38,7 +43,7 @@ async function getPageTranslationState(tabId) {
     // Some tabs cannot receive messages (e.g. chrome:// pages).
   }
 
-  return { isTranslated: false };
+  return { isTranslated: false, lastError: null };
 }
 
 function setActionButtonState(isTranslated, isEnabled = true) {
@@ -51,11 +56,13 @@ async function refreshActionButton() {
 
   if (!tab?.id) {
     setActionButtonState(false, false);
+    setStatusMessage("This tab cannot be translated.");
     return;
   }
 
   const state = await getPageTranslationState(tab.id);
   setActionButtonState(state.isTranslated, true);
+  setStatusMessage(state.lastError ?? "");
 }
 
 async function loadSettings() {
@@ -74,6 +81,7 @@ async function onActionButtonClicked() {
   }
 
   setActionButtonState(false, false);
+  setStatusMessage("");
 
   try {
     const state = await getPageTranslationState(tab.id);
@@ -88,8 +96,10 @@ async function onActionButtonClicked() {
     });
 
     setActionButtonState(Boolean(nextState?.isTranslated), true);
+    setStatusMessage(nextState?.lastError ?? "");
   } catch (error) {
     setActionButtonState(false, true);
+    setStatusMessage("Unable to communicate with this page.");
   }
 }
 
