@@ -213,22 +213,52 @@ function onToggleTranslationRequested(targetLanguage) {
   );
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type !== MESSAGE_TYPES.TOGGLE_PAGE_TRANSLATION_REQUESTED) {
+function getSerializableTranslationState() {
+  return {
+    isTranslated: translationState.isTranslated,
+    targetLanguage: translationState.targetLanguage,
+    totalTranslatedNodes: translationState.translatedNodes.length
+  };
+}
+
+function onPageTranslationActionRequested(action, targetLanguage) {
+  if (action === "restore") {
+    if (translationState.isTranslated) {
+      restoreOriginalText();
+      console.info("[Page Translator] Restored original page text");
+    }
+
+    return getSerializableTranslationState();
+  }
+
+  if (action === "translate") {
+    if (!translationState.isTranslated) {
+      onToggleTranslationRequested(targetLanguage);
+    }
+
+    return getSerializableTranslationState();
+  }
+
+  onToggleTranslationRequested(targetLanguage);
+  return getSerializableTranslationState();
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === MESSAGE_TYPES.GET_PAGE_TRANSLATION_STATE_REQUESTED) {
+    sendResponse(getSerializableTranslationState());
     return;
   }
 
-  const language = message.payload?.targetLanguage ?? "ko";
-  onToggleTranslationRequested(language);
+  if (message?.type === MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED) {
+    const action = message.payload?.action ?? "toggle";
+    const language = message.payload?.targetLanguage ?? "ko";
+    sendResponse(onPageTranslationActionRequested(action, language));
+  }
 });
 
 // Exposed for console-level manual checks while iterating on extraction quality.
 window.__pageTranslatorDebug = {
   collectTranslatableTextSegments,
   getLastExtraction: () => lastExtraction,
-  getTranslationState: () => ({
-    isTranslated: translationState.isTranslated,
-    targetLanguage: translationState.targetLanguage,
-    totalTranslatedNodes: translationState.translatedNodes.length
-  })
+  getTranslationState: getSerializableTranslationState
 };
