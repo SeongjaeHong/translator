@@ -190,12 +190,6 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
               detectedLanguage === DEFAULT_SOURCE_LANGUAGE ||
               confidence < MIN_DETECTION_CONFIDENCE
             ) {
-              console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
-                segmentId: segment.segmentId,
-                detectedLanguage,
-                confidence
-              });
-
               return {
                 segmentId: segment.segmentId,
                 language: DEFAULT_SOURCE_LANGUAGE,
@@ -203,12 +197,6 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
                 skipped: true
               };
             }
-
-            console.info("[Page Translator] Detected source language", {
-              segmentId: segment.segmentId,
-              sourceLanguage: detectedLanguage,
-              confidence
-            });
 
             return {
               segmentId: segment.segmentId,
@@ -253,14 +241,6 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
       segmentsByLanguage.get(sourceLanguage).push(segment);
     });
 
-    console.info("[Page Translator] Grouped segments by detected language", {
-      targetLanguage: normalizedTargetLanguage,
-      groups: Array.from(segmentsByLanguage.entries()).map(([language, groupedSegments]) => ({
-        sourceLanguage: language,
-        segmentCount: groupedSegments.length
-      }))
-    });
-
     const getTranslatorForPair = async (sourceLanguage) => {
       if (!translatorApi?.create) {
         return null;
@@ -268,11 +248,6 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
 
       const cacheKey = createTranslatorCacheKey(sourceLanguage, normalizedTargetLanguage);
       if (translatorByLanguagePair.has(cacheKey)) {
-        console.info("[Page Translator] Reusing cached translator", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage
-        });
-
         return translatorByLanguagePair.get(cacheKey);
       }
 
@@ -288,20 +263,9 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
         });
 
         translatorByLanguagePair.set(cacheKey, translator);
-        console.info("[Page Translator] Created translator for language pair", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage
-        });
-
         return translator;
-      } catch (error) {
+      } catch (_error) {
         unavailableLanguagePairs.add(cacheKey);
-        console.warn("[Page Translator] Translator unavailable for language pair", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage,
-          error: error instanceof Error ? error.message : String(error)
-        });
-
         return null;
       }
     };
@@ -310,10 +274,7 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
       for (const [sourceLanguage, segmentsForLanguage] of segmentsByLanguage.entries()) {
         const normalizedSourceLanguage = normalizeTranslatorLanguageTag(sourceLanguage);
 
-        if (
-          !normalizedSourceLanguage ||
-          normalizedSourceLanguage === normalizedTargetLanguage
-        ) {
+        if (!normalizedSourceLanguage || normalizedSourceLanguage === normalizedTargetLanguage) {
           translated.push(
             ...segmentsForLanguage.map((segment) => ({
               segmentId: segment.segmentId,
@@ -325,24 +286,8 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
                   : "source-language-unavailable"
             }))
           );
-
-          console.info("[Page Translator] Skipping translation group", {
-            sourceLanguage,
-            targetLanguage: normalizedTargetLanguage,
-            segmentCount: segmentsForLanguage.length,
-            reason:
-              normalizedSourceLanguage === normalizedTargetLanguage
-                ? "source-language-matches-target"
-                : "source-language-unavailable"
-          });
           continue;
         }
-
-        console.info("[Page Translator] Translating segment group", {
-          sourceLanguage: normalizedSourceLanguage,
-          targetLanguage: normalizedTargetLanguage,
-          segmentCount: segmentsForLanguage.length
-        });
 
         const translator = await getTranslatorForPair(normalizedSourceLanguage);
 
@@ -379,14 +324,7 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
                   skipped: false,
                   reason: null
                 };
-              } catch (error) {
-                console.warn("[Page Translator] Segment translation failed", {
-                  segmentId: segment.segmentId,
-                  sourceLanguage: normalizedSourceLanguage,
-                  targetLanguage: normalizedTargetLanguage,
-                  error: error instanceof Error ? error.message : String(error)
-                });
-
+              } catch (_error) {
                 return {
                   segmentId: segment.segmentId,
                   translatedText: segment.sourceText,
