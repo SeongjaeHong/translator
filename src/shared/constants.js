@@ -6,7 +6,8 @@ export const STORAGE_KEYS = {
 
 export const CONTEXT_MENU = {
   id: "translate-page",
-  title: "Translate page"
+  titleTranslate: "Translate page",
+  titleRestore: "Restore original"
 };
 
 export const SUPPORTED_TARGET_LANGUAGES = [
