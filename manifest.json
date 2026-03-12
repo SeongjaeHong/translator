@@ -3,7 +3,7 @@
   "name": "Page Translator",
   "version": "0.1.0",
   "description": "Adds a context menu action to translate the current page into your selected language.",
-  "permissions": ["contextMenus", "storage", "scripting", "activeTab"],
+  "permissions": ["contextMenus", "storage", "activeTab"],
   "background": {
     "service_worker": "src/background/service-worker.js",
     "type": "module"
