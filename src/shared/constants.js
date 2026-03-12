@@ -1,7 +1,8 @@
 export const DEFAULT_TARGET_LANGUAGE = "ko";
 
 export const STORAGE_KEYS = {
-  targetLanguage: "targetLanguage"
+  targetLanguage: "targetLanguage",
+  providerConfig: "providerConfig"
 };
 
 export const CONTEXT_MENU = {
