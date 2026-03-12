@@ -27,6 +27,7 @@ const MIN_TRANSLATABLE_LENGTH = 2;
 const MIN_DETECTION_CONFIDENCE = 0.5;
 const INVALID_TRANSLATOR_SOURCE_TAGS = new Set(["auto", "unknown", "und"]);
 const BCP47_STYLE_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i;
+const MAX_TRIVIAL_SEGMENT_LENGTH = 3;
 
 function getLanguageDetectorApi() {
   return globalThis.LanguageDetector;
@@ -96,6 +97,10 @@ function isTrivialSegment(text) {
     return true;
   }
 
+  if (normalized.length <= MAX_TRIVIAL_SEGMENT_LENGTH && !/\s/u.test(normalized)) {
+    return true;
+  }
+
   return !/[\p{L}\p{N}]/u.test(normalized);
 }
 
@@ -144,6 +149,10 @@ async function ensureTranslatorReady(translatorApi, sourceLanguage, targetLangua
 }
 
 class ChromeBuiltInTranslationProvider {
+  constructor(sessionCache) {
+    this.sessionCache = sessionCache;
+  }
+
   async checkAvailability(targetLanguage = DEFAULT_TARGET_LANGUAGE) {
     const languageDetectorApi = getLanguageDetectorApi();
     const translatorApi = getTranslatorApi();
@@ -184,14 +193,39 @@ class ChromeBuiltInTranslationProvider {
       }));
     }
 
-    const detector = await detectorApi.create();
+    const uncachedSegments = [];
     const results = [];
 
+    segments.forEach((segment) => {
+      const cachedLanguage = this.sessionCache.detectedLanguageByText.get(segment.sourceText);
+
+      if (cachedLanguage) {
+        results.push({
+          segmentId: segment.segmentId,
+          language: cachedLanguage,
+          confidence: 1,
+          skipped: cachedLanguage === DEFAULT_SOURCE_LANGUAGE
+        });
+      } else {
+        uncachedSegments.push(segment);
+      }
+    });
+
+    this.sessionCache.metrics.detectionCacheHitCount += results.length;
+    this.sessionCache.metrics.detectionCacheMissCount += uncachedSegments.length;
+
+    if (!uncachedSegments.length) {
+      return results;
+    }
+
+    const detector = await detectorApi.create();
+
     try {
-      for (const chunk of createChunks(segments, DETECTION_CHUNK_SIZE)) {
+      for (const chunk of createChunks(uncachedSegments, DETECTION_CHUNK_SIZE)) {
         const detectedChunk = await Promise.all(
           chunk.map(async (segment) => {
             if (isTrivialSegment(segment.sourceText)) {
+              this.sessionCache.detectedLanguageByText.set(segment.sourceText, DEFAULT_SOURCE_LANGUAGE);
               return {
                 segmentId: segment.segmentId,
                 language: DEFAULT_SOURCE_LANGUAGE,
@@ -209,6 +243,10 @@ class ChromeBuiltInTranslationProvider {
               detectedLanguage === DEFAULT_SOURCE_LANGUAGE ||
               confidence < MIN_DETECTION_CONFIDENCE
             ) {
+              this.sessionCache.detectedLanguageByText.set(
+                segment.sourceText,
+                DEFAULT_SOURCE_LANGUAGE
+              );
               console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
                 segmentId: segment.segmentId,
                 detectedLanguage,
@@ -228,6 +266,8 @@ class ChromeBuiltInTranslationProvider {
               sourceLanguage: detectedLanguage,
               confidence
             });
+
+            this.sessionCache.detectedLanguageByText.set(segment.sourceText, detectedLanguage);
 
             return {
               segmentId: segment.segmentId,
@@ -257,8 +297,7 @@ class ChromeBuiltInTranslationProvider {
 
     const translated = [];
     const segmentsByLanguage = new Map();
-    const translatorByLanguagePair = new Map();
-    const unavailableLanguagePairs = new Set();
+    const translationCache = this.sessionCache.getTranslationCache(normalizedTargetLanguage);
 
     segments.forEach((segment) => {
       const sourceLanguage = normalizeDetectedLanguageTag(
@@ -286,18 +325,21 @@ class ChromeBuiltInTranslationProvider {
       }
 
       const cacheKey = createTranslatorCacheKey(sourceLanguage, normalizedTargetLanguage);
-      if (translatorByLanguagePair.has(cacheKey)) {
+      if (this.sessionCache.translatorByLanguagePair.has(cacheKey)) {
+        this.sessionCache.metrics.translatorCacheHitCount += 1;
         console.info("[Page Translator] Reusing cached translator", {
           sourceLanguage,
           targetLanguage: normalizedTargetLanguage
         });
 
-        return translatorByLanguagePair.get(cacheKey);
+        return this.sessionCache.translatorByLanguagePair.get(cacheKey);
       }
 
-      if (unavailableLanguagePairs.has(cacheKey)) {
+      if (this.sessionCache.unavailableLanguagePairs.has(cacheKey)) {
         return null;
       }
+
+      this.sessionCache.metrics.translatorCacheMissCount += 1;
 
       try {
         await ensureTranslatorReady(translatorApi, sourceLanguage, normalizedTargetLanguage);
@@ -306,7 +348,7 @@ class ChromeBuiltInTranslationProvider {
           targetLanguage: normalizedTargetLanguage
         });
 
-        translatorByLanguagePair.set(cacheKey, translator);
+        this.sessionCache.translatorByLanguagePair.set(cacheKey, translator);
         console.info("[Page Translator] Created translator for language pair", {
           sourceLanguage,
           targetLanguage: normalizedTargetLanguage
@@ -314,7 +356,7 @@ class ChromeBuiltInTranslationProvider {
 
         return translator;
       } catch (error) {
-        unavailableLanguagePairs.add(cacheKey);
+        this.sessionCache.unavailableLanguagePairs.add(cacheKey);
         console.warn("[Page Translator] Translator unavailable for language pair", {
           sourceLanguage,
           targetLanguage: normalizedTargetLanguage,
@@ -325,104 +367,120 @@ class ChromeBuiltInTranslationProvider {
       }
     };
 
-    try {
-      for (const [sourceLanguage, segmentsForLanguage] of segmentsByLanguage.entries()) {
-        const normalizedSourceLanguage = normalizeTranslatorLanguageTag(sourceLanguage);
+    for (const [sourceLanguage, segmentsForLanguage] of segmentsByLanguage.entries()) {
+      const normalizedSourceLanguage = normalizeTranslatorLanguageTag(sourceLanguage);
 
-        if (
-          !normalizedSourceLanguage ||
-          normalizedSourceLanguage === normalizedTargetLanguage
-        ) {
-          translated.push(
-            ...segmentsForLanguage.map((segment) => ({
-              segmentId: segment.segmentId,
-              translatedText: segment.sourceText,
-              skipped: true,
-              reason:
-                normalizedSourceLanguage === normalizedTargetLanguage
-                  ? "source-is-target"
-                  : "source-language-unavailable"
-            }))
-          );
-
-          console.info("[Page Translator] Skipping translation group", {
-            sourceLanguage,
-            targetLanguage: normalizedTargetLanguage,
-            segmentCount: segmentsForLanguage.length,
+      if (
+        !normalizedSourceLanguage ||
+        normalizedSourceLanguage === normalizedTargetLanguage
+      ) {
+        translated.push(
+          ...segmentsForLanguage.map((segment) => ({
+            segmentId: segment.segmentId,
+            translatedText: segment.sourceText,
+            skipped: true,
             reason:
               normalizedSourceLanguage === normalizedTargetLanguage
-                ? "source-language-matches-target"
+                ? "source-is-target"
                 : "source-language-unavailable"
-          });
-          continue;
-        }
+          }))
+        );
 
-        console.info("[Page Translator] Translating segment group", {
-          sourceLanguage: normalizedSourceLanguage,
+        console.info("[Page Translator] Skipping translation group", {
+          sourceLanguage,
           targetLanguage: normalizedTargetLanguage,
-          segmentCount: segmentsForLanguage.length
+          segmentCount: segmentsForLanguage.length,
+          reason:
+            normalizedSourceLanguage === normalizedTargetLanguage
+              ? "source-language-matches-target"
+              : "source-language-unavailable"
         });
-
-        const translator = await getTranslatorForPair(normalizedSourceLanguage);
-
-        if (!translator) {
-          translated.push(
-            ...segmentsForLanguage.map((segment) => ({
-              segmentId: segment.segmentId,
-              translatedText: segment.sourceText,
-              skipped: true,
-              reason: "source-language-unavailable"
-            }))
-          );
-
-          continue;
-        }
-
-        for (const chunk of createChunks(segmentsForLanguage, TRANSLATION_CHUNK_SIZE)) {
-          const translatedChunk = await Promise.all(
-            chunk.map(async (segment) => {
-              if (isTrivialSegment(segment.sourceText)) {
-                return {
-                  segmentId: segment.segmentId,
-                  translatedText: segment.sourceText,
-                  skipped: true,
-                  reason: "trivial"
-                };
-              }
-
-              try {
-                const translatedText = await translator.translate(segment.sourceText);
-                return {
-                  segmentId: segment.segmentId,
-                  translatedText,
-                  skipped: false,
-                  reason: null
-                };
-              } catch (error) {
-                console.warn("[Page Translator] Segment translation failed", {
-                  segmentId: segment.segmentId,
-                  sourceLanguage: normalizedSourceLanguage,
-                  targetLanguage: normalizedTargetLanguage,
-                  error: error instanceof Error ? error.message : String(error)
-                });
-
-                return {
-                  segmentId: segment.segmentId,
-                  translatedText: segment.sourceText,
-                  skipped: true,
-                  reason: "translation-failed"
-                };
-              }
-            })
-          );
-
-          translated.push(...translatedChunk);
-        }
+        continue;
       }
-    } finally {
-      await Promise.all(
-        Array.from(translatorByLanguagePair.values()).map((translator) => translator.destroy?.())
-      );
+
+      console.info("[Page Translator] Translating segment group", {
+        sourceLanguage: normalizedSourceLanguage,
+        targetLanguage: normalizedTargetLanguage,
+        segmentCount: segmentsForLanguage.length
+      });
+
+      const translator = await getTranslatorForPair(normalizedSourceLanguage);
+
+      if (!translator) {
+        translated.push(
+          ...segmentsForLanguage.map((segment) => ({
+            segmentId: segment.segmentId,
+            translatedText: segment.sourceText,
+            skipped: true,
+            reason: "source-language-unavailable"
+          }))
+        );
+
+        continue;
+      }
+
+      for (const chunk of createChunks(segmentsForLanguage, TRANSLATION_CHUNK_SIZE)) {
+        const translatedChunk = await Promise.all(
+          chunk.map(async (segment) => {
+            if (isTrivialSegment(segment.sourceText)) {
+              return {
+                segmentId: segment.segmentId,
+                translatedText: segment.sourceText,
+                skipped: true,
+                reason: "trivial"
+              };
+            }
+
+            const translationCacheKey = createTranslatorCacheKey(
+              normalizedSourceLanguage,
+              segment.sourceText
+            );
+            const hasCachedTranslation = translationCache.has(translationCacheKey);
+            const cachedTranslation = hasCachedTranslation
+              ? translationCache.get(translationCacheKey)
+              : null;
+
+            if (hasCachedTranslation) {
+              this.sessionCache.metrics.translationCacheHitCount += 1;
+              return {
+                segmentId: segment.segmentId,
+                translatedText: cachedTranslation,
+                skipped: false,
+                reason: "cache-hit"
+              };
+            }
+
+            this.sessionCache.metrics.translationCacheMissCount += 1;
+
+            try {
+              const translatedText = await translator.translate(segment.sourceText);
+              translationCache.set(translationCacheKey, translatedText);
+              return {
+                segmentId: segment.segmentId,
+                translatedText,
+                skipped: false,
+                reason: null
+              };
+            } catch (error) {
+              console.warn("[Page Translator] Segment translation failed", {
+                segmentId: segment.segmentId,
+                sourceLanguage: normalizedSourceLanguage,
+                targetLanguage: normalizedTargetLanguage,
+                error: error instanceof Error ? error.message : String(error)
+              });
+
+              return {
+                segmentId: segment.segmentId,
+                translatedText: segment.sourceText,
+                skipped: true,
+                reason: "translation-failed"
+              };
+            }
+          })
+        );
+
+        translated.push(...translatedChunk);
+      }
     }
 
     return translated;
@@ -431,7 +489,7 @@ class ChromeBuiltInTranslationProvider {
 
 
 function createTranslationProvider() {
-  return new ChromeBuiltInTranslationProvider();
+  return new ChromeBuiltInTranslationProvider(translationSessionCache);
 }
 
 const EXCLUDED_TAGS = new Set([
@@ -446,6 +504,35 @@ const EXCLUDED_TAGS = new Set([
 ]);
 
 let lastExtraction = null;
+
+const translationSessionCache = {
+  detectedLanguageByText: new Map(),
+  translatedByTargetLanguage: new Map(),
+  translatorByLanguagePair: new Map(),
+  unavailableLanguagePairs: new Set(),
+  metrics: {
+    detectionCacheHitCount: 0,
+    detectionCacheMissCount: 0,
+    translatorCacheHitCount: 0,
+    translatorCacheMissCount: 0,
+    translationCacheHitCount: 0,
+    translationCacheMissCount: 0
+  },
+  getTranslationCache(targetLanguage) {
+    if (!this.translatedByTargetLanguage.has(targetLanguage)) {
+      this.translatedByTargetLanguage.set(targetLanguage, new Map());
+    }
+
+    return this.translatedByTargetLanguage.get(targetLanguage);
+  },
+  invalidateTargetTranslationCache(targetLanguage) {
+    if (!targetLanguage) {
+      return;
+    }
+
+    this.translatedByTargetLanguage.delete(targetLanguage);
+  }
+};
 
 const translationState = {
   isTranslated: false,
@@ -574,12 +661,20 @@ function createStatsFromResults(extraction, detectedLanguages, translatedSegment
   const translatedCount = translatedSegments.filter((item) => !item.skipped).length;
   const skippedCount = extraction.segments.length - translatedCount;
 
+  const detectedLanguageGroups = detectedLanguages.reduce((groups, item) => {
+    const currentCount = groups[item.language] ?? 0;
+    groups[item.language] = currentCount + 1;
+    return groups;
+  }, {});
+
   return {
     extractionCount: extraction.segments.length,
     detectedLanguageCount: detectedCount,
+    detectedLanguageGroups,
     translatedCount,
     skippedCount,
-    restoredCount: 0
+    restoredCount: 0,
+    cacheMetrics: { ...translationSessionCache.metrics }
   };
 }
 
@@ -641,7 +736,8 @@ function resetStateAfterRestore(restoredCount = 0) {
     detectedLanguageCount: translationState.lastStats?.detectedLanguageCount ?? 0,
     translatedCount: 0,
     skippedCount: 0,
-    restoredCount
+    restoredCount,
+    cacheMetrics: { ...translationSessionCache.metrics }
   };
 }
 
@@ -676,6 +772,12 @@ async function applyTranslation(targetLanguage) {
   const extraction = collectTranslatableTextSegments(document.body);
   lastExtraction = extraction;
 
+  console.info("[Page Translator] Extraction stats", {
+    totalTextNodesFound: extraction.totalTextNodesFound,
+    totalSkippedNodes: extraction.totalSkippedNodes,
+    extractedSegmentCount: extraction.segments.length
+  });
+
   if (extraction.segments.length === 0) {
     translationState.isTranslated = false;
     translationState.targetLanguage = null;
@@ -686,7 +788,8 @@ async function applyTranslation(targetLanguage) {
       detectedLanguageCount: 0,
       translatedCount: 0,
       skippedCount: 0,
-      restoredCount: 0
+      restoredCount: 0,
+      cacheMetrics: { ...translationSessionCache.metrics }
     };
 
     return;
@@ -717,15 +820,24 @@ async function applyTranslation(targetLanguage) {
   translationState.lastError = null;
   translationState.lastStats = stats;
 
+  console.info("[Page Translator] Cache metrics", translationSessionCache.metrics);
+
   console.info("[Page Translator] Translation stats", stats);
 }
 
 async function translateOrRetranslate(targetLanguage) {
+  const normalizedTargetLanguage = targetLanguage || DEFAULT_TARGET_LANGUAGE;
+  const previousTargetLanguage = translationState.targetLanguage;
+
   if (translationState.isTranslated) {
     restoreOriginalText();
   }
 
-  await applyTranslation(targetLanguage);
+  if (previousTargetLanguage && previousTargetLanguage !== normalizedTargetLanguage) {
+    translationSessionCache.invalidateTargetTranslationCache(previousTargetLanguage);
+  }
+
+  await applyTranslation(normalizedTargetLanguage);
 }
 
 function getSerializableTranslationState() {
@@ -799,7 +911,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           detectedLanguageCount: 0,
           translatedCount: 0,
           skippedCount: lastExtraction?.segments.length ?? 0,
-          restoredCount: 0
+          restoredCount: 0,
+          cacheMetrics: { ...translationSessionCache.metrics }
         };
 
         console.warn("[Page Translator] Translation request failed", {
