@@ -13,8 +13,15 @@ function getActionLabel(isTranslated) {
   return isTranslated ? "Restore original" : "Translate page";
 }
 
-function setStatusMessage(message = "") {
+function setStatusMessage(message = "", tone = "neutral") {
   statusMessage.textContent = message;
+
+  if (message) {
+    statusMessage.dataset.tone = tone;
+    return;
+  }
+
+  delete statusMessage.dataset.tone;
 }
 
 function getUserFacingActionError(error) {
@@ -33,14 +40,23 @@ function getUserFacingActionError(error) {
 
 function buildStatusFromState(state) {
   if (state?.lastError) {
-    return state.lastError;
+    return {
+      message: state.lastError,
+      tone: "error"
+    };
   }
 
   if (state?.inFlightAction) {
-    return "Translation in progress...";
+    return {
+      message: "Translation in progress...",
+      tone: "neutral"
+    };
   }
 
-  return state?.isTranslated ? "Page is translated." : "";
+  return {
+    message: state?.isTranslated ? "Page is translated." : "",
+    tone: "neutral"
+  };
 }
 
 function isRestrictedTabUrl(url) {
@@ -117,13 +133,14 @@ async function refreshActionButton() {
 
   if (!tab?.id || isRestrictedTabUrl(tab.url)) {
     setActionButtonState(false, false);
-    setStatusMessage("This tab cannot be translated.");
+    setStatusMessage("This tab cannot be translated.", "error");
     return;
   }
 
   const state = await getPageTranslationState(tab);
   setActionButtonState(state.isTranslated, true);
-  setStatusMessage(buildStatusFromState(state));
+  const status = buildStatusFromState(state);
+  setStatusMessage(status.message, status.tone);
 }
 
 async function loadSettings() {
@@ -138,7 +155,7 @@ async function saveSettings() {
 async function onActionButtonClicked() {
   const tab = await getActiveTab();
   if (!tab?.id || isRestrictedTabUrl(tab.url)) {
-    setStatusMessage("This tab cannot be translated.");
+    setStatusMessage("This tab cannot be translated.", "error");
     return;
   }
 
@@ -161,10 +178,11 @@ async function onActionButtonClicked() {
     });
 
     setActionButtonState(Boolean(nextState?.isTranslated), true);
-    setStatusMessage(buildStatusFromState(nextState));
+    const status = buildStatusFromState(nextState);
+    setStatusMessage(status.message, status.tone);
   } catch (error) {
     setActionButtonState(false, true);
-    setStatusMessage(getUserFacingActionError(error));
+    setStatusMessage(getUserFacingActionError(error), "error");
   }
 }
 
