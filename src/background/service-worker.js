@@ -55,7 +55,6 @@ async function ensureTargetLanguageDefault() {
 
 async function ensureContentScriptLoaded(tabId) {
   if (!tabId) {
-    console.warn("[Page Translator][ContextMenu] Missing tab id for content script readiness check");
     return false;
   }
 
@@ -64,26 +63,15 @@ async function ensureContentScriptLoaded(tabId) {
       type: MESSAGE_TYPES.GET_PAGE_TRANSLATION_STATE_REQUESTED
     });
     return true;
-  } catch (error) {
-    console.info("[Page Translator][ContextMenu] Content script not reachable; attempting injection", {
-      tabId,
-      error: error instanceof Error ? error.message : String(error)
-    });
-
+  } catch (_error) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ["src/shared/runtime-shared.js", "src/content/content-script.js"]
       });
 
-      console.info("[Page Translator][ContextMenu] Content script injected", { tabId });
       return true;
-    } catch (injectionError) {
-      console.error("[Page Translator][ContextMenu] Failed to inject content script", {
-        tabId,
-        error: injectionError instanceof Error ? injectionError.message : String(injectionError)
-      });
-
+    } catch (_injectionError) {
       return false;
     }
   }
@@ -94,12 +82,7 @@ async function getActiveTabId() {
   return tabs[0]?.id;
 }
 
-async function setContextMenuErrorState(tabId, errorMessage) {
-  console.error("[Page Translator][ContextMenu] Translation action failed", {
-    tabId,
-    error: errorMessage
-  });
-
+async function setContextMenuErrorState(_tabId, errorMessage) {
   await chrome.action.setBadgeBackgroundColor({ color: "#B00020" });
   await chrome.action.setBadgeText({ text: "ERR" });
   await chrome.action.setTitle({
@@ -157,7 +140,7 @@ async function getPageTranslationState(tabId) {
     if (typeof state?.isTranslated === "boolean") {
       return state;
     }
-  } catch (error) {
+  } catch (_error) {
     // Some pages cannot receive messages (e.g. chrome:// URLs).
   }
 

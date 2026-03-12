@@ -26,6 +26,11 @@ const DEFAULT_SOURCE_LANGUAGE = "und";
 const MIN_TRANSLATABLE_LENGTH = 2;
 const MIN_DETECTION_CONFIDENCE = 0.5;
 const MIN_DETECTION_TEXT_LENGTH = 4;
+const DOMINANT_SAMPLE_LIMIT = 24;
+const DOMINANT_MIN_SAMPLE_COUNT = 3;
+const DOMINANT_MIN_SHARE = 0.6;
+const DOMINANT_MIN_CONFIDENCE = 0.55;
+const EXCEPTION_DETECTION_MIN_LENGTH = 24;
 const INVALID_TRANSLATOR_SOURCE_TAGS = new Set(["auto", "unknown", "und"]);
 const BCP47_STYLE_PATTERN = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i;
 const MAX_TRIVIAL_SEGMENT_LENGTH = 3;
@@ -221,10 +226,22 @@ class ChromeBuiltInTranslationProvider {
     }
   }
 
-  async detectLanguages(segments) {
+  async getOrCreateDetector() {
     const detectorApi = getLanguageDetectorApi();
 
     if (!detectorApi?.create) {
+      return null;
+    }
+
+    const detector = this.sessionCache.detector ?? (await detectorApi.create());
+    this.sessionCache.detector = detector;
+    return detector;
+  }
+
+  async detectLanguagesForSegments(segments) {
+    const detector = await this.getOrCreateDetector();
+
+    if (!detector) {
       return segments.map((segment) => ({
         segmentId: segment.segmentId,
         language: DEFAULT_SOURCE_LANGUAGE,
@@ -258,8 +275,7 @@ class ChromeBuiltInTranslationProvider {
       return results;
     }
 
-    const detector = this.sessionCache.detector ?? (await detectorApi.create());
-    this.sessionCache.detector = detector;
+    const detectionStart = performance.now();
 
     for (const chunk of createChunks(uncachedSegments, DETECTION_CHUNK_SIZE)) {
       const detectedChunk = await Promise.all(
@@ -291,14 +307,6 @@ class ChromeBuiltInTranslationProvider {
 
           this.sessionCache.detectedLanguageByText.set(segment.sourceText, detectionResult);
 
-          if (shouldSkip) {
-            console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
-              segmentId: segment.segmentId,
-              detectedLanguage,
-              confidence
-            });
-          }
-
           return {
             segmentId: segment.segmentId,
             ...detectionResult
@@ -309,7 +317,164 @@ class ChromeBuiltInTranslationProvider {
       results.push(...detectedChunk);
     }
 
+    this.sessionCache.metrics.detectionExecutionMs += performance.now() - detectionStart;
+
     return results;
+  }
+
+  selectRepresentativeSegments(segments) {
+    return [...segments]
+      .filter((segment) => !shouldSkipLanguageDetection(segment.sourceText))
+      .sort((a, b) => b.sourceText.length - a.sourceText.length)
+      .slice(0, DOMINANT_SAMPLE_LIMIT);
+  }
+
+  decideDominantLanguage(sampleDetections, representativeSegments) {
+    if (sampleDetections.length < DOMINANT_MIN_SAMPLE_COUNT) {
+      return null;
+    }
+
+    const aggregate = new Map();
+
+    sampleDetections.forEach((detection) => {
+      if (detection.skipped || detection.language === DEFAULT_SOURCE_LANGUAGE) {
+        return;
+      }
+
+      const segment = representativeSegments.find((item) => item.segmentId === detection.segmentId);
+      const weight = Math.max(1, segment?.sourceText.length ?? 1);
+      const score = weight * Math.max(0.1, detection.confidence || 0);
+      const current = aggregate.get(detection.language) ?? { score: 0, weightedConfidence: 0, count: 0 };
+      current.score += score;
+      current.weightedConfidence += score * (detection.confidence || 0);
+      current.count += 1;
+      aggregate.set(detection.language, current);
+    });
+
+    if (!aggregate.size) {
+      return null;
+    }
+
+    const sorted = [...aggregate.entries()].sort((a, b) => b[1].score - a[1].score);
+    const [dominantLanguage, dominantData] = sorted[0];
+    const totalScore = sorted.reduce((sum, [, data]) => sum + data.score, 0);
+    const dominantShare = totalScore ? dominantData.score / totalScore : 0;
+    const dominantConfidence = dominantData.score
+      ? dominantData.weightedConfidence / dominantData.score
+      : 0;
+
+    if (dominantShare < DOMINANT_MIN_SHARE || dominantConfidence < DOMINANT_MIN_CONFIDENCE) {
+      return {
+        language: dominantLanguage,
+        confidence: dominantConfidence,
+        share: dominantShare,
+        strong: false
+      };
+    }
+
+    return {
+      language: dominantLanguage,
+      confidence: dominantConfidence,
+      share: dominantShare,
+      strong: true
+    };
+  }
+
+  async detectLanguagesOptimized(segments) {
+    const representativeSegments = this.selectRepresentativeSegments(segments);
+    const sampleDetections = await this.detectLanguagesForSegments(representativeSegments);
+    const dominantDecision = this.decideDominantLanguage(sampleDetections, representativeSegments);
+
+    this.sessionCache.metrics.sampledSegmentCount = representativeSegments.length;
+    this.sessionCache.metrics.dominantLanguage = dominantDecision?.language ?? null;
+    this.sessionCache.metrics.dominantLanguageConfidence = dominantDecision?.confidence ?? 0;
+
+    if (!dominantDecision?.strong) {
+      this.sessionCache.metrics.fallbackPathCount += 1;
+      const detectedLanguages = await this.detectLanguagesForSegments(segments);
+      return {
+        detectedLanguages,
+        dominantDecision: {
+          ...dominantDecision,
+          usedFastPath: false
+        }
+      };
+    }
+
+    this.sessionCache.metrics.fastPathCount += 1;
+
+    const detectedById = new Map();
+    const exceptionCandidates = [];
+    const dominantScriptGroup = getScriptGroupForText(
+      representativeSegments.find((segment) => segment.sourceText)?.sourceText ?? ""
+    );
+
+    segments.forEach((segment) => {
+      if (shouldSkipLanguageDetection(segment.sourceText)) {
+        detectedById.set(segment.segmentId, {
+          segmentId: segment.segmentId,
+          language: DEFAULT_SOURCE_LANGUAGE,
+          confidence: 0,
+          skipped: true
+        });
+        return;
+      }
+
+      const scriptGroup = getScriptGroupForText(segment.sourceText);
+      const shouldDetectAsException =
+        segment.sourceText.length >= EXCEPTION_DETECTION_MIN_LENGTH &&
+        scriptGroup !== "unknown" &&
+        dominantScriptGroup !== "unknown" &&
+        scriptGroup !== dominantScriptGroup;
+
+      if (shouldDetectAsException) {
+        exceptionCandidates.push(segment);
+      } else {
+        detectedById.set(segment.segmentId, {
+          segmentId: segment.segmentId,
+          language: dominantDecision.language,
+          confidence: dominantDecision.confidence,
+          skipped: false
+        });
+      }
+    });
+
+    this.sessionCache.metrics.exceptionDetectionCount += exceptionCandidates.length;
+
+    if (exceptionCandidates.length) {
+      const exceptionDetections = await this.detectLanguagesForSegments(exceptionCandidates);
+      exceptionDetections.forEach((result) => {
+        if (!result.skipped && result.language !== DEFAULT_SOURCE_LANGUAGE) {
+          detectedById.set(result.segmentId, result);
+          return;
+        }
+
+        detectedById.set(result.segmentId, {
+          segmentId: result.segmentId,
+          language: dominantDecision.language,
+          confidence: dominantDecision.confidence,
+          skipped: false
+        });
+      });
+    }
+
+    const detectedLanguages = segments.map((segment) =>
+      detectedById.get(segment.segmentId) ?? {
+        segmentId: segment.segmentId,
+        language: dominantDecision.language,
+        confidence: dominantDecision.confidence,
+        skipped: false
+      }
+    );
+
+    return {
+      detectedLanguages,
+      dominantDecision: {
+        ...dominantDecision,
+        usedFastPath: true,
+        exceptionCandidateCount: exceptionCandidates.length
+      }
+    };
   }
 
   async translateSegments(segments, targetLanguage, detectedLanguagesBySegmentId) {
@@ -336,14 +501,6 @@ class ChromeBuiltInTranslationProvider {
       segmentsByLanguage.get(sourceLanguage).push(segment);
     });
 
-    console.info("[Page Translator] Grouped segments by detected language", {
-      targetLanguage: normalizedTargetLanguage,
-      groups: Array.from(segmentsByLanguage.entries()).map(([language, groupedSegments]) => ({
-        sourceLanguage: language,
-        segmentCount: groupedSegments.length
-      }))
-    });
-
     const getTranslatorForPair = async (sourceLanguage) => {
       if (!translatorApi?.create) {
         return null;
@@ -352,11 +509,6 @@ class ChromeBuiltInTranslationProvider {
       const cacheKey = createTranslatorCacheKey(sourceLanguage, normalizedTargetLanguage);
       if (this.sessionCache.translatorByLanguagePair.has(cacheKey)) {
         this.sessionCache.metrics.translatorCacheHitCount += 1;
-        console.info("[Page Translator] Reusing cached translator", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage
-        });
-
         return this.sessionCache.translatorByLanguagePair.get(cacheKey);
       }
 
@@ -368,27 +520,21 @@ class ChromeBuiltInTranslationProvider {
       this.sessionCache.metrics.translatorCacheMissCount += 1;
 
       try {
+        const availabilityStart = performance.now();
         await ensureTranslatorReady(translatorApi, sourceLanguage, normalizedTargetLanguage);
+        this.sessionCache.metrics.translatorAvailabilityMs += performance.now() - availabilityStart;
+
+        const createStart = performance.now();
         const translator = await translatorApi.create({
           sourceLanguage,
           targetLanguage: normalizedTargetLanguage
         });
+        this.sessionCache.metrics.translatorCreateMs += performance.now() - createStart;
 
         this.sessionCache.translatorByLanguagePair.set(cacheKey, translator);
-        console.info("[Page Translator] Created translator for language pair", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage
-        });
-
         return translator;
-      } catch (error) {
+      } catch (_error) {
         this.sessionCache.unavailableLanguagePairs.add(cacheKey);
-        console.warn("[Page Translator] Translator unavailable for language pair", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage,
-          error: error instanceof Error ? error.message : String(error)
-        });
-
         return null;
       }
     };
@@ -396,10 +542,7 @@ class ChromeBuiltInTranslationProvider {
     for (const [sourceLanguage, segmentsForLanguage] of segmentsByLanguage.entries()) {
       const normalizedSourceLanguage = normalizeTranslatorLanguageTag(sourceLanguage);
 
-      if (
-        !normalizedSourceLanguage ||
-        normalizedSourceLanguage === normalizedTargetLanguage
-      ) {
+      if (!normalizedSourceLanguage || normalizedSourceLanguage === normalizedTargetLanguage) {
         translated.push(
           ...segmentsForLanguage.map((segment) => ({
             segmentId: segment.segmentId,
@@ -411,24 +554,8 @@ class ChromeBuiltInTranslationProvider {
                 : "source-language-unavailable"
           }))
         );
-
-        console.info("[Page Translator] Skipping translation group", {
-          sourceLanguage,
-          targetLanguage: normalizedTargetLanguage,
-          segmentCount: segmentsForLanguage.length,
-          reason:
-            normalizedSourceLanguage === normalizedTargetLanguage
-              ? "source-language-matches-target"
-              : "source-language-unavailable"
-        });
         continue;
       }
-
-      console.info("[Page Translator] Translating segment group", {
-        sourceLanguage: normalizedSourceLanguage,
-        targetLanguage: normalizedTargetLanguage,
-        segmentCount: segmentsForLanguage.length
-      });
 
       const translator = await getTranslatorForPair(normalizedSourceLanguage);
 
@@ -479,7 +606,9 @@ class ChromeBuiltInTranslationProvider {
             this.sessionCache.metrics.translationCacheMissCount += 1;
 
             try {
+              const executionStart = performance.now();
               const translatedText = await translator.translate(segment.sourceText);
+              this.sessionCache.metrics.translationExecutionMs += performance.now() - executionStart;
               translationCache.set(translationCacheKey, translatedText);
               return {
                 segmentId: segment.segmentId,
@@ -487,14 +616,7 @@ class ChromeBuiltInTranslationProvider {
                 skipped: false,
                 reason: null
               };
-            } catch (error) {
-              console.warn("[Page Translator] Segment translation failed", {
-                segmentId: segment.segmentId,
-                sourceLanguage: normalizedSourceLanguage,
-                targetLanguage: normalizedTargetLanguage,
-                error: error instanceof Error ? error.message : String(error)
-              });
-
+            } catch (_error) {
               return {
                 segmentId: segment.segmentId,
                 translatedText: segment.sourceText,
@@ -512,6 +634,7 @@ class ChromeBuiltInTranslationProvider {
     return translated;
   }
 }
+
 
 
 function createTranslationProvider() {
@@ -544,7 +667,17 @@ const translationSessionCache = {
     translatorCacheHitCount: 0,
     translatorCacheMissCount: 0,
     translationCacheHitCount: 0,
-    translationCacheMissCount: 0
+    translationCacheMissCount: 0,
+    sampledSegmentCount: 0,
+    dominantLanguage: null,
+    dominantLanguageConfidence: 0,
+    fastPathCount: 0,
+    fallbackPathCount: 0,
+    exceptionDetectionCount: 0,
+    detectionExecutionMs: 0,
+    translatorAvailabilityMs: 0,
+    translatorCreateMs: 0,
+    translationExecutionMs: 0
   },
   getTranslationCache(targetLanguage) {
     if (!this.translatedByTargetLanguage.has(targetLanguage)) {
@@ -630,6 +763,44 @@ function isUserFacingSegment(text) {
   return /[\p{L}\p{N}]/u.test(text);
 }
 
+function getScriptGroupForText(text) {
+  if (!text || typeof text !== "string") {
+    return "unknown";
+  }
+
+  const sample = text.slice(0, 200);
+  const hasCjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(sample);
+  if (hasCjk) {
+    return "cjk";
+  }
+
+  if (/\p{Script=Cyrillic}/u.test(sample)) {
+    return "cyrillic";
+  }
+
+  if (/\p{Script=Arabic}/u.test(sample)) {
+    return "arabic";
+  }
+
+  if (/\p{Script=Devanagari}/u.test(sample)) {
+    return "devanagari";
+  }
+
+  if (/\p{Script=Hebrew}/u.test(sample)) {
+    return "hebrew";
+  }
+
+  if (/\p{Script=Greek}/u.test(sample)) {
+    return "greek";
+  }
+
+  if (/\p{Script=Latin}/u.test(sample)) {
+    return "latin";
+  }
+
+  return "unknown";
+}
+
 function collectTranslatableTextSegments(root = document.body) {
   if (!root) {
     return {
@@ -699,7 +870,13 @@ function collectTranslatableTextSegments(root = document.body) {
   };
 }
 
-function createStatsFromResults(extraction, detectedLanguages, translatedSegments) {
+function createStatsFromResults(
+  extraction,
+  detectedLanguages,
+  translatedSegments,
+  pipelineMetrics,
+  domWriteMetrics
+) {
   const detectedCount = detectedLanguages.filter((item) => !item.skipped).length;
   const translatedCount = translatedSegments.filter((item) => !item.skipped).length;
   const skippedCount = extraction.segments.length - translatedCount;
@@ -717,6 +894,22 @@ function createStatsFromResults(extraction, detectedLanguages, translatedSegment
     translatedCount,
     skippedCount,
     restoredCount: 0,
+    sampledSegmentCount: pipelineMetrics.sampledSegmentCount ?? 0,
+    dominantLanguageDecision: {
+      language: pipelineMetrics.dominantLanguage ?? null,
+      confidence: pipelineMetrics.dominantLanguageConfidence ?? 0,
+      usedFastPath: pipelineMetrics.usedFastPath ?? false,
+      fallbackUsed: pipelineMetrics.fallbackUsed ?? true,
+      exceptionCandidateCount: pipelineMetrics.exceptionCandidateCount ?? 0
+    },
+    stageDurationsMs: {
+      extraction: pipelineMetrics.extractionMs ?? 0,
+      availability: pipelineMetrics.availabilityMs ?? 0,
+      detection: pipelineMetrics.detectionMs ?? 0,
+      translation: pipelineMetrics.translationMs ?? 0,
+      domWrite: pipelineMetrics.domWriteMs ?? 0
+    },
+    domWriteMetrics,
     cacheMetrics: { ...translationSessionCache.metrics }
   };
 }
@@ -805,7 +998,6 @@ function restoreOriginalText() {
   });
 
   resetStateAfterRestore(restoredCount);
-  console.info("[Page Translator] Restore stats", translationState.lastStats);
 }
 
 function invalidateTranslationStateForTargetChange(nextTargetLanguage) {
@@ -833,14 +1025,10 @@ function validateCapability(capability) {
 }
 
 async function applyTranslation(targetLanguage) {
+  const extractionStart = performance.now();
   const extraction = collectTranslatableTextSegments(document.body);
+  const extractionMs = performance.now() - extractionStart;
   lastExtraction = extraction;
-
-  console.info("[Page Translator] Extraction stats", {
-    totalTextNodesFound: extraction.totalTextNodesFound,
-    totalSkippedNodes: extraction.totalSkippedNodes,
-    extractedSegmentCount: extraction.segments.length
-  });
 
   if (extraction.segments.length === 0) {
     translationState.isTranslated = false;
@@ -853,6 +1041,16 @@ async function applyTranslation(targetLanguage) {
       translatedCount: 0,
       skippedCount: 0,
       restoredCount: 0,
+      sampledSegmentCount: 0,
+      dominantLanguageDecision: null,
+      stageDurationsMs: {
+        extraction: extractionMs,
+        availability: 0,
+        detection: 0,
+        translation: 0,
+        domWrite: 0
+      },
+      domWriteMetrics: { updatedNodeCount: 0, unchangedNodeCount: 0 },
       cacheMetrics: { ...translationSessionCache.metrics }
     };
 
@@ -861,25 +1059,55 @@ async function applyTranslation(targetLanguage) {
 
   const provider = createTranslationProvider();
   const normalizedTargetLanguage = targetLanguage || DEFAULT_TARGET_LANGUAGE;
+
+  const availabilityStart = performance.now();
   const capability = await provider.checkAvailability(normalizedTargetLanguage);
+  const availabilityMs = performance.now() - availabilityStart;
   validateCapability(capability);
 
-  const detectedLanguages = await provider.detectLanguages(extraction.segments);
+  const detectionStart = performance.now();
+  const { detectedLanguages, dominantDecision } = await provider.detectLanguagesOptimized(
+    extraction.segments
+  );
+  const detectionMs = performance.now() - detectionStart;
   const detectedLanguagesBySegmentId = new Map(
     detectedLanguages.map((result) => [result.segmentId, result.language])
   );
 
+  const translationStart = performance.now();
   const translatedSegments = await provider.translateSegments(
     extraction.segments,
     normalizedTargetLanguage,
     detectedLanguagesBySegmentId
   );
+  const translationMs = performance.now() - translationStart;
 
+  const domWriteStart = performance.now();
   const { translatedNodes, updatedNodeCount, unchangedNodeCount } = writeTranslatedTextToNodes(
     extraction,
     translatedSegments
   );
-  const stats = createStatsFromResults(extraction, detectedLanguages, translatedSegments);
+  const domWriteMs = performance.now() - domWriteStart;
+
+  const stats = createStatsFromResults(
+    extraction,
+    detectedLanguages,
+    translatedSegments,
+    {
+      extractionMs,
+      availabilityMs,
+      detectionMs,
+      translationMs,
+      domWriteMs,
+      sampledSegmentCount: translationSessionCache.metrics.sampledSegmentCount,
+      dominantLanguage: dominantDecision?.language ?? null,
+      dominantLanguageConfidence: dominantDecision?.confidence ?? 0,
+      usedFastPath: Boolean(dominantDecision?.usedFastPath),
+      fallbackUsed: !dominantDecision?.usedFastPath,
+      exceptionCandidateCount: dominantDecision?.exceptionCandidateCount ?? 0
+    },
+    { updatedNodeCount, unchangedNodeCount }
+  );
 
   translationState.isTranslated = true;
   translationState.targetLanguage = normalizedTargetLanguage;
@@ -888,14 +1116,6 @@ async function applyTranslation(targetLanguage) {
   translationState.lastAppliedTargetLanguage = normalizedTargetLanguage;
   translationState.lastStats = stats;
 
-  console.info("[Page Translator] Cache metrics", translationSessionCache.metrics);
-
-  console.info("[Page Translator] DOM write stats", {
-    updatedNodeCount,
-    unchangedNodeCount
-  });
-
-  console.info("[Page Translator] Translation stats", stats);
 }
 
 async function translateOrRetranslate(targetLanguage) {
@@ -982,11 +1202,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           restoredCount: 0,
           cacheMetrics: { ...translationSessionCache.metrics }
         };
-
-        console.warn("[Page Translator] Translation request failed", {
-          error: errorMessage,
-          stats: translationState.lastStats
-        });
 
         sendResponse(getSerializableTranslationState());
       });
