@@ -12,6 +12,7 @@ export const CONTEXT_MENU = {
 export const SUPPORTED_TARGET_LANGUAGES = [
   { code: "ko", label: "Korean" },
   { code: "en", label: "English" },
-  { code: "ja", label: "Japanese" },
+  { code: "de", label: "German" },
+  { code: "fr", label: "French" },
   { code: "es", label: "Spanish" }
 ];
