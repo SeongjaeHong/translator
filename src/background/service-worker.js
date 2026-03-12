@@ -49,15 +49,17 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 });
 
-chrome.contextMenus.onShown.addListener(async (info, tab) => {
-  if (!info.contexts.includes("page")) {
-    return;
-  }
+if (chrome.contextMenus?.onShown?.addListener) {
+  chrome.contextMenus.onShown.addListener(async (info, tab) => {
+    if (!info.contexts.includes("page")) {
+      return;
+    }
 
-  const state = await getPageTranslationState(tab?.id);
-  await updateContextMenuTitle(state.isTranslated);
-  chrome.contextMenus.refresh();
-});
+    const state = await getPageTranslationState(tab?.id);
+    await updateContextMenuTitle(state.isTranslated);
+    chrome.contextMenus.refresh();
+  });
+}
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== CONTEXT_MENU.id || !tab?.id) {
