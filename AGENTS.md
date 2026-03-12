@@ -2,61 +2,40 @@
 
 ## Project overview
 This repository contains a Chrome Extension built with Manifest V3.
-Preserve the extension architecture and avoid broad refactors unless explicitly requested.
+The extension adds a context menu item to translate the current page into a user-selected target language.
 
-## Product goals
-- Keep the extension lightweight and stable.
-- Minimize permissions and host permissions.
-- Prefer simple, maintainable code over clever abstractions.
-- Preserve user-visible behavior unless the task explicitly changes it.
+## Product rules
+- Default target language is Korean.
+- The user must be able to change the target language from a dropdown UI.
+- The extension should attempt to translate multilingual pages comprehensively, not assume a single source language for the whole page.
 
 ## Architecture rules
-- Do not change `manifest.json` structure unless required for the task.
-- Do not upgrade or downgrade Manifest version unless explicitly requested.
-- Keep responsibilities separated:
-  - `background` / service worker: lifecycle, messaging, alarms, storage sync
-  - `content scripts`: DOM access and page interaction
-  - `popup` / options pages: UI only
-- Do not move logic across these layers unless necessary.
+- Use Manifest V3 only.
+- Use a service worker for context menu creation and message routing.
+- Use content scripts for DOM text extraction and replacement.
+- Use chrome.storage for settings persistence.
+- Keep the translation provider abstracted behind an interface.
 
-## Security and privacy rules
-- Request the smallest possible set of permissions.
-- Never add remote code execution patterns.
-- Never add inline scripts if avoidable.
-- Never store secrets in the repository.
-- Treat user data as sensitive and minimize collection/storage.
-
-## Git rules
-- Never commit binary files.
-- Never commit `.zip`, `.crx`, `.pem`, `dist/`, `build/`, `node_modules/`, or secret files.
-- Keep PRs small and task-focused.
-- Prefer editing existing files over introducing many new files.
+## Security and permissions
+- Keep permissions minimal.
+- Do not add host permissions broadly unless required.
+- Do not commit secrets, API keys, binary files, or generated artifacts.
 
 ## Coding rules
-- Prefer clear naming and small functions.
-- Avoid unnecessary dependencies.
-- Add comments only when the logic is not obvious.
-- Keep logs minimal and remove temporary debug logs before finishing.
+- Keep patches minimal and task-focused.
+- Prefer editing existing files over adding many new files.
+- Do not perform broad refactors unless explicitly asked.
 
-## Testing and validation
-Before finishing:
-1. Check for manifest consistency.
-2. Verify imports and file paths.
-3. Ensure permissions are still minimal.
-4. Ensure background/content/popup messaging still matches.
-5. If tests exist, run them.
-6. If build scripts exist, run the build.
-7. Summarize changed files and remaining risks.
-
-## Output format
-When completing a task:
-- Summarize what changed.
-- List any manifest or permission changes explicitly.
-- Call out any manual browser verification steps.
-- Keep the patch minimal.
+## Validation checklist
+Before finishing a task:
+1. Confirm manifest.json remains valid.
+2. Confirm permissions are still minimal.
+3. Confirm the context menu wiring works.
+4. Confirm storage reads/writes work.
+5. Confirm message passing between service worker and content script works.
+6. Summarize changed files and manual test steps.
 
 ## Forbidden actions
-- Do not add tracking/analytics without explicit instruction.
-- Do not introduce binary assets unless explicitly requested.
-- Do not commit generated artifacts.
-- Do not rename major folders unless explicitly requested.
+- Do not commit dist/, build/, node_modules/, .zip, .crx, .pem, .env files.
+- Do not add analytics or tracking.
+- Do not change MV3 to another manifest version.
