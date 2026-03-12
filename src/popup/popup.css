@@ -14,7 +14,12 @@ label {
   font-size: 13px;
 }
 
-select {
+select,
+button {
   font-size: 14px;
   padding: 4px 6px;
+}
+
+button {
+  cursor: pointer;
 }
