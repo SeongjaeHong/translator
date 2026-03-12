@@ -107,7 +107,21 @@ export class ChromeBuiltInTranslationProvider extends BaseTranslationProvider {
 
     try {
       await ensureDetectorReady(languageDetectorApi);
-      await ensureTranslatorReady(translatorApi, "en", normalizeLanguageTag(targetLanguage));
+      // Translator readiness is validated later per detected source language.
+      // Do not gate the entire feature on a single assumed source language.
+      if (typeof translatorApi?.availability === "function") {
+        const availability = await translatorApi.availability({
+          sourceLanguage: "auto",
+          targetLanguage: normalizeLanguageTag(targetLanguage)
+        });
+
+        if (availability === "unavailable") {
+          throw new Error(
+            `Translator API availability for auto->${normalizeLanguageTag(targetLanguage)} is unavailable.`
+          );
+        }
+      }
+
       return { isAvailable: true, reason: null };
     } catch (error) {
       return {

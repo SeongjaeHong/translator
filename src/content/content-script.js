@@ -151,6 +151,20 @@ function createStatsFromResults(extraction, detectedLanguages, translatedSegment
   };
 }
 
+function rehydrateWhitespace(originalText, normalizedText, translatedText) {
+  if (typeof translatedText !== "string") {
+    return translatedText;
+  }
+
+  if (originalText === normalizedText) {
+    return translatedText;
+  }
+
+  const leadingWhitespace = originalText.match(/^\s*/u)?.[0] ?? "";
+  const trailingWhitespace = originalText.match(/\s*$/u)?.[0] ?? "";
+  return `${leadingWhitespace}${translatedText}${trailingWhitespace}`;
+}
+
 function writeTranslatedTextToNodes(extraction, translatedSegments) {
   const translatedSegmentsById = new Map(
     translatedSegments.map((segment) => [segment.segmentId, segment.translatedText])
@@ -167,11 +181,17 @@ function writeTranslatedTextToNodes(extraction, translatedSegments) {
         return;
       }
 
-      nodeMapping.textNode.nodeValue = translatedText;
+      const translatedNodeText = rehydrateWhitespace(
+        nodeMapping.originalText,
+        nodeMapping.normalizedText,
+        translatedText
+      );
+
+      nodeMapping.textNode.nodeValue = translatedNodeText;
       translatedNodes.push({
         textNode: nodeMapping.textNode,
         originalText: nodeMapping.originalText,
-        translatedText
+        translatedText: translatedNodeText
       });
     });
   });
