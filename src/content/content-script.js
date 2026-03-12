@@ -24,6 +24,8 @@ const DETECTION_CHUNK_SIZE = 20;
 const TRANSLATION_CHUNK_SIZE = 10;
 const DEFAULT_SOURCE_LANGUAGE = "und";
 const MIN_TRANSLATABLE_LENGTH = 2;
+const MIN_DETECTION_CONFIDENCE = 0.5;
+const INVALID_TRANSLATOR_SOURCE_TAGS = new Set(["auto", "unknown", "und"]);
 
 function getLanguageDetectorApi() {
   return globalThis.LanguageDetector;
@@ -38,8 +40,21 @@ function normalizeLanguageTag(languageTag) {
     return DEFAULT_SOURCE_LANGUAGE;
   }
 
-  const normalized = languageTag.trim().toLowerCase();
-  return normalized || DEFAULT_SOURCE_LANGUAGE;
+  const normalized = languageTag.trim();
+
+  if (!normalized) {
+    return DEFAULT_SOURCE_LANGUAGE;
+  }
+
+  if (INVALID_TRANSLATOR_SOURCE_TAGS.has(normalized.toLowerCase())) {
+    return DEFAULT_SOURCE_LANGUAGE;
+  }
+
+  try {
+    return Intl.getCanonicalLocales(normalized)[0] ?? DEFAULT_SOURCE_LANGUAGE;
+  } catch (_error) {
+    return DEFAULT_SOURCE_LANGUAGE;
+  }
 }
 
 function getPrimaryDetectionResult(detectionResult) {
@@ -127,17 +142,9 @@ class ChromeBuiltInTranslationProvider {
     try {
       await ensureDetectorReady(languageDetectorApi);
 
-      if (typeof translatorApi?.availability === "function") {
-        const availability = await translatorApi.availability({
-          sourceLanguage: "auto",
-          targetLanguage: normalizeLanguageTag(targetLanguage)
-        });
-
-        if (availability === "unavailable") {
-          throw new Error(
-            `Translator API availability for auto->${normalizeLanguageTag(targetLanguage)} is unavailable.`
-          );
-        }
+      const normalizedTargetLanguage = normalizeLanguageTag(targetLanguage);
+      if (normalizedTargetLanguage === DEFAULT_SOURCE_LANGUAGE) {
+        throw new Error(`Invalid target language: ${String(targetLanguage)}`);
       }
 
       return { isAvailable: true, reason: null };
@@ -179,10 +186,37 @@ class ChromeBuiltInTranslationProvider {
 
             const detection = await detector.detect(segment.sourceText);
             const primary = getPrimaryDetectionResult(detection);
+            const detectedLanguage = normalizeLanguageTag(primary?.detectedLanguage);
+            const confidence = primary?.confidence ?? 0;
+
+            if (
+              detectedLanguage === DEFAULT_SOURCE_LANGUAGE ||
+              confidence < MIN_DETECTION_CONFIDENCE
+            ) {
+              console.info("[Page Translator] Skipping segment due to weak/invalid language detection", {
+                segmentId: segment.segmentId,
+                detectedLanguage,
+                confidence
+              });
+
+              return {
+                segmentId: segment.segmentId,
+                language: DEFAULT_SOURCE_LANGUAGE,
+                confidence,
+                skipped: true
+              };
+            }
+
+            console.info("[Page Translator] Detected source language", {
+              segmentId: segment.segmentId,
+              sourceLanguage: detectedLanguage,
+              confidence
+            });
+
             return {
               segmentId: segment.segmentId,
-              language: normalizeLanguageTag(primary?.detectedLanguage),
-              confidence: primary?.confidence ?? 0,
+              language: detectedLanguage,
+              confidence,
               skipped: false
             };
           })
@@ -232,8 +266,24 @@ class ChromeBuiltInTranslationProvider {
                 : "source-language-unavailable"
           }))
         );
+
+        console.info("[Page Translator] Skipping translation group", {
+          sourceLanguage,
+          targetLanguage: normalizedTargetLanguage,
+          segmentCount: segmentsForLanguage.length,
+          reason:
+            sourceLanguage === normalizedTargetLanguage
+              ? "source-language-matches-target"
+              : "source-language-unavailable"
+        });
         continue;
       }
+
+      console.info("[Page Translator] Translating segment group", {
+        sourceLanguage,
+        targetLanguage: normalizedTargetLanguage,
+        segmentCount: segmentsForLanguage.length
+      });
 
       await ensureTranslatorReady(translatorApi, sourceLanguage, normalizedTargetLanguage);
       const translator = await translatorApi.create({
@@ -254,12 +304,29 @@ class ChromeBuiltInTranslationProvider {
                 };
               }
 
-              return {
-                segmentId: segment.segmentId,
-                translatedText: await translator.translate(segment.sourceText),
-                skipped: false,
-                reason: null
-              };
+              try {
+                const translatedText = await translator.translate(segment.sourceText);
+                return {
+                  segmentId: segment.segmentId,
+                  translatedText,
+                  skipped: false,
+                  reason: null
+                };
+              } catch (error) {
+                console.warn("[Page Translator] Segment translation failed", {
+                  segmentId: segment.segmentId,
+                  sourceLanguage,
+                  targetLanguage: normalizedTargetLanguage,
+                  error: error instanceof Error ? error.message : String(error)
+                });
+
+                return {
+                  segmentId: segment.segmentId,
+                  translatedText: segment.sourceText,
+                  skipped: true,
+                  reason: "translation-failed"
+                };
+              }
             })
           );
 
