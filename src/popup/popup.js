@@ -17,6 +17,20 @@ function setStatusMessage(message = "") {
   statusMessage.textContent = message;
 }
 
+function getUserFacingActionError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+
+  if (message === "content-script-unavailable") {
+    return "This tab cannot be translated.";
+  }
+
+  if (message && message !== "Error") {
+    return message;
+  }
+
+  return "Unable to communicate with this page.";
+}
+
 function buildStatusFromState(state) {
   if (state?.lastError) {
     return state.lastError;
@@ -150,7 +164,7 @@ async function onActionButtonClicked() {
     setStatusMessage(buildStatusFromState(nextState));
   } catch (error) {
     setActionButtonState(false, true);
-    setStatusMessage("Unable to communicate with this page.");
+    setStatusMessage(getUserFacingActionError(error));
   }
 }
 
