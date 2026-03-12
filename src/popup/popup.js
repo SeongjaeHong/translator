@@ -5,7 +5,6 @@ import {
 } from "../shared/target-language.js";
 
 const languageSelect = document.querySelector("#target-language");
-const status = document.querySelector("#status");
 
 async function loadSettings() {
   languageSelect.value = await getTargetLanguage();
@@ -13,11 +12,6 @@ async function loadSettings() {
 
 async function saveSettings() {
   await setTargetLanguage(languageSelect.value);
-
-  status.textContent = "Saved.";
-  window.setTimeout(() => {
-    status.textContent = "";
-  }, 1200);
 }
 
 renderTargetLanguageOptions(languageSelect);
