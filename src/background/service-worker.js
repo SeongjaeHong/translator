@@ -15,18 +15,33 @@ async function updateContextMenuTitle(isTranslated) {
 }
 
 async function ensureContextMenu() {
-  try {
-    await chrome.contextMenus.create({
-      id: CONTEXT_MENU.id,
-      title: CONTEXT_MENU.titleTranslate,
-      contexts: ["page"]
+  await new Promise((resolve, reject) => {
+    chrome.contextMenus.remove(CONTEXT_MENU.id, () => {
+      const removeError = chrome.runtime.lastError;
+
+      if (removeError && !removeError.message.includes("Cannot find menu item")) {
+        reject(new Error(removeError.message));
+        return;
+      }
+
+      chrome.contextMenus.create(
+        {
+          id: CONTEXT_MENU.id,
+          title: CONTEXT_MENU.titleTranslate,
+          contexts: ["page"]
+        },
+        () => {
+          const createError = chrome.runtime.lastError;
+          if (createError) {
+            reject(new Error(createError.message));
+            return;
+          }
+
+          resolve();
+        }
+      );
     });
-  } catch (error) {
-    // Ignore duplicate id errors when the service worker restarts.
-    if (!String(error?.message ?? "").includes("Cannot create item with duplicate id")) {
-      throw error;
-    }
-  }
+  });
 }
 
 async function ensureTargetLanguageDefault() {
