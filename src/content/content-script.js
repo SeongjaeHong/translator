@@ -1,4 +1,6 @@
 import { MESSAGE_TYPES } from "../shared/messages.js";
+import { createDefaultProviderConfig } from "../shared/providers.js";
+import { createTranslationProvider } from "./providers/provider-factory.js";
 
 const EXCLUDED_TAGS = new Set([
   "SCRIPT",
@@ -139,16 +141,20 @@ function collectTranslatableTextSegments(root = document.body) {
   };
 }
 
-function createMockTranslation(sourceText, targetLanguage) {
-  return `[${targetLanguage}] ${sourceText}`;
-}
+async function applyTranslation(extraction, targetLanguage, providerId, providerConfig) {
+  const provider = createTranslationProvider(providerId, providerConfig);
+  const detectedLanguages = await provider.detectLanguages(extraction.segments);
+  const detectedLanguagesBySegmentId = new Map(
+    detectedLanguages.map((result) => [result.segmentId, result.language])
+  );
+  const translatedSegments = await provider.translateSegments(
+    extraction.segments,
+    targetLanguage,
+    detectedLanguagesBySegmentId
+  );
 
-function applyTranslation(extraction, targetLanguage) {
   const translatedSegmentsById = new Map(
-    extraction.segments.map((segment) => [
-      segment.segmentId,
-      createMockTranslation(segment.sourceText, targetLanguage)
-    ])
+    translatedSegments.map((segment) => [segment.segmentId, segment.translatedText])
   );
 
   const translatedNodes = [];
@@ -190,7 +196,7 @@ function restoreOriginalText() {
   translationState.translatedNodes = [];
 }
 
-function onToggleTranslationRequested(targetLanguage) {
+async function onToggleTranslationRequested(targetLanguage, providerId, providerConfig) {
   if (translationState.isTranslated) {
     restoreOriginalText();
     console.info("[Page Translator] Restored original page text");
@@ -199,12 +205,13 @@ function onToggleTranslationRequested(targetLanguage) {
 
   const extraction = collectTranslatableTextSegments(document.body);
   lastExtraction = extraction;
-  applyTranslation(extraction, targetLanguage);
+  await applyTranslation(extraction, targetLanguage, providerId, providerConfig);
 
   console.info(
-    "[Page Translator] Applied mock translation to DOM text segments",
+    "[Page Translator] Applied provider-based translation to DOM text segments",
     {
       targetLanguage,
+      providerId,
       totalTextNodesFound: extraction.totalTextNodesFound,
       totalTextSegmentsExtracted: extraction.segments.length,
       totalSkippedNodes: extraction.totalSkippedNodes,
@@ -221,7 +228,12 @@ function getSerializableTranslationState() {
   };
 }
 
-function onPageTranslationActionRequested(action, targetLanguage) {
+async function onPageTranslationActionRequested(
+  action,
+  targetLanguage,
+  providerId,
+  providerConfig
+) {
   if (action === "restore") {
     if (translationState.isTranslated) {
       restoreOriginalText();
@@ -233,13 +245,13 @@ function onPageTranslationActionRequested(action, targetLanguage) {
 
   if (action === "translate") {
     if (!translationState.isTranslated) {
-      onToggleTranslationRequested(targetLanguage);
+      await onToggleTranslationRequested(targetLanguage, providerId, providerConfig);
     }
 
     return getSerializableTranslationState();
   }
 
-  onToggleTranslationRequested(targetLanguage);
+  await onToggleTranslationRequested(targetLanguage, providerId, providerConfig);
   return getSerializableTranslationState();
 }
 
@@ -252,7 +264,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED) {
     const action = message.payload?.action ?? "toggle";
     const language = message.payload?.targetLanguage ?? "ko";
-    sendResponse(onPageTranslationActionRequested(action, language));
+    const providerId = message.payload?.providerId;
+    const providerConfig =
+      message.payload?.providerConfig ?? createDefaultProviderConfig();
+
+    onPageTranslationActionRequested(
+      action,
+      language,
+      providerId,
+      providerConfig
+    )
+      .then((state) => sendResponse(state))
+      .catch((_error) => sendResponse(getSerializableTranslationState()));
+
+    return true;
   }
 });
 

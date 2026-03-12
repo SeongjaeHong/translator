@@ -4,6 +4,7 @@ import {
   renderTargetLanguageOptions,
   setTargetLanguage
 } from "../shared/target-language.js";
+import { getProviderConfig, getSelectedProvider } from "../shared/provider-settings.js";
 
 const languageSelect = document.querySelector("#target-language");
 const actionButton = document.querySelector("#translate-action");
@@ -79,12 +80,16 @@ async function onActionButtonClicked() {
     const state = await getPageTranslationState(tab.id);
     const targetLanguage = await getTargetLanguage();
     const action = getActionFromState(state.isTranslated);
+    const providerId = await getSelectedProvider();
+    const providerConfig = await getProviderConfig();
 
     const nextState = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
       payload: {
         action,
-        targetLanguage
+        targetLanguage,
+        providerId,
+        providerConfig
       }
     });
 
