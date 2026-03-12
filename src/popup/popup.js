@@ -29,18 +29,57 @@ function buildStatusFromState(state) {
   return state?.isTranslated ? "Page is translated." : "";
 }
 
+function isRestrictedTabUrl(url) {
+  if (!url || typeof url !== "string") {
+    return true;
+  }
+
+  return /^(chrome|edge|about|devtools|view-source):/u.test(url);
+}
+
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs[0];
 }
 
-async function getPageTranslationState(tabId) {
+async function ensureContentScriptLoaded(tabId) {
   if (!tabId) {
-    return { isTranslated: false, lastError: null };
+    return false;
   }
 
   try {
-    const state = await chrome.tabs.sendMessage(tabId, {
+    await chrome.tabs.sendMessage(tabId, {
+      type: MESSAGE_TYPES.GET_PAGE_TRANSLATION_STATE_REQUESTED
+    });
+    return true;
+  } catch (error) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["src/shared/runtime-shared.js", "src/content/content-script.js"]
+      });
+      return true;
+    } catch (injectionError) {
+      return false;
+    }
+  }
+}
+
+async function getPageTranslationState(tab) {
+  if (!tab?.id) {
+    return { isTranslated: false, lastError: null };
+  }
+
+  const isReady = await ensureContentScriptLoaded(tab.id);
+  if (!isReady) {
+    return {
+      isTranslated: false,
+      lastError: "This tab cannot be translated."
+    };
+  }
+
+  try {
+    const state = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.GET_PAGE_TRANSLATION_STATE_REQUESTED
     });
 
@@ -62,13 +101,13 @@ function setActionButtonState(isTranslated, isEnabled = true) {
 async function refreshActionButton() {
   const tab = await getActiveTab();
 
-  if (!tab?.id) {
+  if (!tab?.id || isRestrictedTabUrl(tab.url)) {
     setActionButtonState(false, false);
     setStatusMessage("This tab cannot be translated.");
     return;
   }
 
-  const state = await getPageTranslationState(tab.id);
+  const state = await getPageTranslationState(tab);
   setActionButtonState(state.isTranslated, true);
   setStatusMessage(buildStatusFromState(state));
 }
@@ -84,7 +123,8 @@ async function saveSettings() {
 
 async function onActionButtonClicked() {
   const tab = await getActiveTab();
-  if (!tab?.id) {
+  if (!tab?.id || isRestrictedTabUrl(tab.url)) {
+    setStatusMessage("This tab cannot be translated.");
     return;
   }
 
@@ -92,6 +132,11 @@ async function onActionButtonClicked() {
   setStatusMessage("");
 
   try {
+    const isReady = await ensureContentScriptLoaded(tab.id);
+    if (!isReady) {
+      throw new Error("content-script-unavailable");
+    }
+
     const targetLanguage = await getTargetLanguage();
     const nextState = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
