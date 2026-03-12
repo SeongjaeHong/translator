@@ -9,16 +9,24 @@ const languageSelect = document.querySelector("#target-language");
 const actionButton = document.querySelector("#translate-action");
 const statusMessage = document.querySelector("#status-message");
 
-function getActionFromState(isTranslated) {
-  return isTranslated ? "restore" : "translate";
-}
-
 function getActionLabel(isTranslated) {
   return isTranslated ? "Restore original" : "Translate page";
 }
 
 function setStatusMessage(message = "") {
   statusMessage.textContent = message;
+}
+
+function buildStatusFromState(state) {
+  if (state?.lastError) {
+    return state.lastError;
+  }
+
+  if (state?.inFlightAction) {
+    return "Translation in progress...";
+  }
+
+  return state?.isTranslated ? "Page is translated." : "";
 }
 
 async function getActiveTab() {
@@ -62,7 +70,7 @@ async function refreshActionButton() {
 
   const state = await getPageTranslationState(tab.id);
   setActionButtonState(state.isTranslated, true);
-  setStatusMessage(state.lastError ?? "");
+  setStatusMessage(buildStatusFromState(state));
 }
 
 async function loadSettings() {
@@ -84,19 +92,17 @@ async function onActionButtonClicked() {
   setStatusMessage("");
 
   try {
-    const state = await getPageTranslationState(tab.id);
     const targetLanguage = await getTargetLanguage();
-    const action = getActionFromState(state.isTranslated);
     const nextState = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
       payload: {
-        action,
+        action: "toggle",
         targetLanguage
       }
     });
 
     setActionButtonState(Boolean(nextState?.isTranslated), true);
-    setStatusMessage(nextState?.lastError ?? "");
+    setStatusMessage(buildStatusFromState(nextState));
   } catch (error) {
     setActionButtonState(false, true);
     setStatusMessage("Unable to communicate with this page.");
