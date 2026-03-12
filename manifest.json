@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Page Translator",
+  "version": "0.1.0",
+  "description": "Adds a context menu action to translate the current page into your selected language.",
+  "permissions": ["contextMenus", "storage", "scripting", "activeTab"],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "src/options/options.html"
+}
