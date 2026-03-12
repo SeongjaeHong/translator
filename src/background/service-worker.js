@@ -40,6 +40,7 @@ async function ensureTargetLanguageDefault() {
 
 async function ensureContentScriptLoaded(tabId) {
   if (!tabId) {
+    console.warn("[Page Translator][ContextMenu] Missing tab id for content script readiness check");
     return false;
   }
 
@@ -49,16 +50,78 @@ async function ensureContentScriptLoaded(tabId) {
     });
     return true;
   } catch (error) {
+    console.info("[Page Translator][ContextMenu] Content script not reachable; attempting injection", {
+      tabId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ["src/shared/runtime-shared.js", "src/content/content-script.js"]
       });
+
+      console.info("[Page Translator][ContextMenu] Content script injected", { tabId });
       return true;
     } catch (injectionError) {
+      console.error("[Page Translator][ContextMenu] Failed to inject content script", {
+        tabId,
+        error: injectionError instanceof Error ? injectionError.message : String(injectionError)
+      });
+
       return false;
     }
   }
+}
+
+async function getActiveTabId() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.id;
+}
+
+async function setContextMenuErrorState(tabId, errorMessage) {
+  console.error("[Page Translator][ContextMenu] Translation action failed", {
+    tabId,
+    error: errorMessage
+  });
+
+  await chrome.action.setBadgeBackgroundColor({ color: "#B00020" });
+  await chrome.action.setBadgeText({ text: "ERR" });
+  await chrome.action.setTitle({
+    title: `Page Translator: ${errorMessage}`
+  });
+}
+
+async function clearContextMenuErrorState() {
+  await chrome.action.setBadgeText({ text: "" });
+  await chrome.action.setTitle({ title: "Page Translator" });
+}
+
+async function runTranslationAction(tabId, targetLanguage) {
+  const resolvedTabId = tabId ?? (await getActiveTabId());
+
+  if (!resolvedTabId) {
+    throw new Error("Unable to identify an active tab for translation.");
+  }
+
+  const isReady = await ensureContentScriptLoaded(resolvedTabId);
+  if (!isReady) {
+    throw new Error("This tab cannot be translated because the content script is unavailable.");
+  }
+
+  const nextState = await chrome.tabs.sendMessage(resolvedTabId, {
+    type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
+    payload: {
+      action: "toggle",
+      targetLanguage
+    }
+  });
+
+  if (nextState?.lastError) {
+    throw new Error(nextState.lastError);
+  }
+
+  return nextState;
 }
 
 async function getPageTranslationState(tabId) {
@@ -110,28 +173,21 @@ if (chrome.contextMenus?.onShown?.addListener) {
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== CONTEXT_MENU.id || !tab?.id) {
+  if (info.menuItemId !== CONTEXT_MENU.id) {
     return;
   }
 
   const targetLanguage = await getTargetLanguage();
 
   try {
-    const isReady = await ensureContentScriptLoaded(tab.id);
-    if (!isReady) {
-      throw new Error("content-script-unavailable");
-    }
-
-    const nextState = await chrome.tabs.sendMessage(tab.id, {
-      type: MESSAGE_TYPES.PAGE_TRANSLATION_ACTION_REQUESTED,
-      payload: {
-        action: "toggle",
-        targetLanguage
-      }
-    });
-
+    const nextState = await runTranslationAction(tab?.id, targetLanguage);
+    await clearContextMenuErrorState();
     await updateContextMenuTitle(Boolean(nextState?.isTranslated));
   } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : "Unable to communicate with this page.";
+
+    await setContextMenuErrorState(tab?.id, errorMessage);
     await updateContextMenuTitle(false);
   }
 });
